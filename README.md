@@ -1,6 +1,21 @@
 On-chain proofs: docs/proofs.md
 # Web3 DApp Suite (DeFi + Bridge) — Next.js + wagmi/viem
 
+## Screenshots
+
+### Bridge (OP Sepolia → Sepolia)
+![Bridge](docs/images/bridge.png)
+
+### Swap / Pool (AMM)
+![Swap](docs/images/swap.png)
+
+### Farm (Staking)
+![Farm](docs/images/farm.png)
+
+### Launchpad (IDO)
+![Launchpad](docs/images/launchpad.png)
+
+
 一个用于演示与学习的 Web3 DApp 项目集合，包含 **Swap/Pool、Farm、Launchpad、Bridge** 模块。
 本仓库基于课程实战项目做了较大幅度的工程化改造与功能完善（重点在：链上交互闭环、异步状态建模、轮询并发控制、错误兜底与可复现配置）。
 
