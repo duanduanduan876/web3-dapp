@@ -67,4 +67,6 @@ Contract addresses and representative tx hashes:
 - Relayer uses server-only env vars (SEPOLIA_RPC_URL / OP_SEPOLIA_RPC_URL / RELAYER_PRIVATE_KEY).
 - `.env.local` is gitignored; `.env.example` contains placeholders only.
 
+- 默认跑本地前端：http://localhost:3000
+
 
