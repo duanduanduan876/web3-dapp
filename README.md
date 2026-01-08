@@ -1,6 +1,10 @@
 On-chain proofs: docs/proofs.md
 # Web3 DApp Suite (DeFi + Bridge) — Next.js + wagmi/viem
 
+- Online demo: (coming soon)
+- On-chain proofs: `docs/proofs.md`
+- Key highlights: tx lifecycle UI + polling concurrency control + event-driven progress
+
 ## Screenshots
 
 ### Bridge (OP Sepolia → Sepolia)
