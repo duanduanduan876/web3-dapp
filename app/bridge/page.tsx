@@ -5,13 +5,20 @@ import { useAccount, useChainId, useReadContract, useSwitchChain, useWriteContra
 import { useConnectModal } from '@rainbow-me/rainbowkit'
 import { formatUnits, isAddress, parseUnits } from 'viem'
 import { useCallback } from 'react'
+import { type Address } from 'viem'
+
 
 const OP_SEPOLIA_CHAIN_ID = 11155420
 const SEPOLIA_CHAIN_ID = 11155111
 const DECIMALS = 18n
 
 const tokenA = process.env.NEXT_PUBLIC_BRIDGE_TOKEN_A_ADDRESS
-const sourceBridge = process.env.NEXT_PUBLIC_BRIDGE_SOURCE_BRIDGE_ADDRESS
+type HexAddress = `0x${string}`
+
+const sourceBridge = process.env.NEXT_PUBLIC_BRIDGE_SOURCE_BRIDGE_ADDRESS as HexAddress | undefined
+
+
+
 const ERC20_ABI = [
   { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'a', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
   { type: 'function', name: 'allowance', stateMutability: 'view', inputs: [{ name: 'o', type: 'address' }, { name: 's', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
@@ -172,7 +179,8 @@ export default function BridgePage() {
     address: tokenA as any,
     abi: ERC20_ABI,
     functionName: 'allowance',
-    args: address && sourceBridge ? [address, sourceBridge] : undefined,
+    args: address && sourceBridge ? ([address, sourceBridge] as const) : undefined,
+
     query: { enabled: canRead },
   })
 
