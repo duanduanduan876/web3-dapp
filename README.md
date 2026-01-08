@@ -25,7 +25,22 @@
 - Networks: Sepolia / OP Sepolia（按环境变量配置）
 
 ## Running Locally
-1) Install
-```bash
+
+### Env
+Copy env template and fill your own values:
+
+- Windows PowerShell:
+  copy .env.example .env.local
+
+- macOS/Linux:
+  cp .env.example .env.local
+
+### Start
 npm i
+npm run dev
+
+### On-chain Proofs
+Contract addresses and representative tx hashes:
+- see `docs/proofs.md`
+
 
