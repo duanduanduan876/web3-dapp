@@ -71,4 +71,18 @@ Contract addresses and representative tx hashes:
 
 - 默认跑本地前端：http://localhost:3000
 
+“How to Try the Demo (Sepolia / OP Sepolia)”
+
+Install MetaMask
+
+Switch network to OP Sepolia / Sepolia (按模块提示)
+
+Get test ETH from faucet
+
+For Bridge: approve → bridge → wait status
+
+For Swap/Pool: approve → addLiquidity → swap → removeLiquidity
+
+Proofs: docs/proofs.md
+
 
