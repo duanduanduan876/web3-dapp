@@ -8,10 +8,10 @@ Contracts:
 - LP Share: N/A (liquidity share tracked internally in Swap contract)
 
 Tx:
-- approve TokenA -> Swap: 0x8ac042e729f18054809f98ebc843fbc74675be9f2b2cd390bdf33c96af2e7307
-- addLiquidity:0x71dd75fcba74d824455ff36865db9ce7b470008fa9ec0405fd18620e6d154ba3
-- swap: 0x39bc94240df8afc36df18fecfeab4c5067408ba1722f6b8596735ebca813eca0
-- removeLiquidity: 0xe1ac359abd8f1c87e0cb40d6daf015080e55c4c151acf3b58716f46253b7a1a3
+- approve TokenA -> Swap: 0x8ac042e729f18054809f98ebc843fbc74675be9f2b2cd390bdf33c96af2e7307 (ERC20 approve: allow Swap to spend TokenA for addLiquidity/swap)
+- addLiquidity: 0x71dd75fcba74d824455ff36865db9ce7b470008fa9ec0405fd18620e6d154ba3 (Add liquidity: deposit TokenA/TokenB into AMM; mint internal liquidity share tracked in Swap storage)
+- swap: 0x39bc94240df8afc36df18fecfeab4c5067408ba1722f6b8596735ebca813eca0 (Swap execution: trade TokenA <-> TokenB via AMM pricing; emits swap-related events/logs)
+- removeLiquidity: 0xe1ac359abd8f1c87e0cb40d6daf015080e55c4c151acf3b58716f46253b7a1a3 (Remove liquidity: burn internal liquidity share; withdraw underlying TokenA/TokenB back to user)
 
 ## Farm (Sepolia)
 Contracts:
@@ -20,10 +20,10 @@ Contracts:
 - RewardToken (ERC20): 0xAF533A87fAE69d014aFbFE8481367E6F8DC3F78E
 
 Tx:
-- approve LP -> Farm: 0x2577c46a4df49750052e50a90e2bb65352cb8a44a903ef6348836ba9fb496565
-- deposit(poolId=...): 0x3bd8b249fc3923bffca9444daf07b8ca686e52c33eaeb21f816bd537410bcd6b
-- harvest: 0xe2d923d88fae498229c4fa32b2b45187a9d129dcbc590407d280928fcafc1c84
-- withdraw: 0x7a04d930d73005ba94bb135c89786a2524f5f92d187ccf3b824b027b3c808d66
+- approve StakingToken -> Farm: 0x2577c46a4df49750052e50a90e2bb65352cb8a44a903ef6348836ba9fb496565 (ERC20 approve: allow Farm to transfer staking token from user for deposit)
+- deposit(poolId=...): 0x3bd8b249fc3923bffca9444daf07b8ca686e52c33eaeb21f816bd537410bcd6b (Stake: deposit staking token into Farm; user.amount/rewardDebt updated; starts earning rewards)
+- harvest: 0xe2d923d88fae498229c4fa32b2b45187a9d129dcbc590407d280928fcafc1c84 (Claim rewards only: calculate pending reward and transfer RewardToken to user; updates reward accounting)
+- withdraw: 0x7a04d930d73005ba94bb135c89786a2524f5f92d187ccf3b824b027b3c808d66 (Unstake: withdraw staked token from Farm; may also settle pending rewards depending on implementation)
 
 ## Bridge (OP Sepolia -> Sepolia)
 Contracts:
@@ -32,8 +32,8 @@ Contracts:
 - BridgeTokenA: 0x0744F4f9449Ded9fF9B314e7A234a9E6630e0Da4
 
 Tx:
-- source bridge tx: 0xfa3ae46a9c95118bcac4095db5e0ecbbf42339a4ca530bae4d0323d73aacf56d
-- target mint tx: 0x9b95849524f4b84340ce71918c5a4c23af2211eb819ce35588de134d627145bb
+- source bridge tx: 0xfa3ae46a9c95118bcac4095db5e0ecbbf42339a4ca530bae4d0323d73aacf56d (Source chain action: user bridges on OP Sepolia; token burn/lock + BridgeInitiated event with transferId)
+- target mint tx: 0x9b95849524f4b84340ce71918c5a4c23af2211eb819ce35588de134d627145bb (Target chain action: relayer verifies source receipt/event and mints token on Sepolia to recipient)
 
 ## Launchpad (Sepolia)
 Contracts:
@@ -42,6 +42,6 @@ Contracts:
 - ProjectToken: 0x75Fe321aF5649DbC28D6655506dCeF642F5d647b
 
 Tx:
-- approve paymentToken -> Launchpad: 0xedad6ca65e4c6e359a9d12ecb4b77f7ada4422fd5c9356b5419cb8fc9e08a1b0
-- contribute(projectId=19): 0xd372e6142bdacda84522760b799c57068e636b9ce6f5b2d018196b3472c4363a
-- claim(projectId=19):0x9f588920988460cdb17048f6883ca05d2caf47f65205bc0170aa4751894b9150
+- approve PaymentToken -> Launchpad: 0xedad6ca65e4c6e359a9d12ecb4b77f7ada4422fd5c9356b5419cb8fc9e08a1b0 (ERC20 approve: allow Launchpad to spend payment token for contribution)
+- contribute(projectId=19): 0xd372e6142bdacda84522760b799c57068e636b9ce6f5b2d018196b3472c4363a (Contribute: user pays PaymentToken into projectId=19; contribution recorded for later claim)
+- claim(projectId=19): 0x9f588920988460cdb17048f6883ca05d2caf47f65205bc0170aa4751894b9150 (Claim: after sale finalized, user claims ProjectToken allocation for projectId=19)
