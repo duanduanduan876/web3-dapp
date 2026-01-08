@@ -5,6 +5,8 @@ On-chain proofs: docs/proofs.md
 - On-chain proofs: `docs/proofs.md`
 - Key highlights: tx lifecycle UI + polling concurrency control + event-driven progress
 
+- https://web3-dapp-two.vercel.app/
+
 ## Screenshots
 
 ### Bridge (OP Sepolia → Sepolia)
