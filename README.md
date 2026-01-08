@@ -1,3 +1,4 @@
+On-chain proofs: docs/proofs.md
 # Web3 DApp Suite (DeFi + Bridge) — Next.js + wagmi/viem
 
 一个用于演示与学习的 Web3 DApp 项目集合，包含 **Swap/Pool、Farm、Launchpad、Bridge** 模块。
