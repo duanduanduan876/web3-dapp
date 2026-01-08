@@ -43,6 +43,8 @@ npm run dev
 Contract addresses and representative tx hashes:
 - see `docs/proofs.md`
 
-- Relayer uses server-only env vars (SEPOLIA_RPC_URL / OP_SEPOLIA_RPC_URL / RELAYER_PRIVATE_KEY). .env.local is gitignored; .env.example contains placeholders only.
+### Notes
+- Relayer uses server-only env vars (SEPOLIA_RPC_URL / OP_SEPOLIA_RPC_URL / RELAYER_PRIVATE_KEY).
+- `.env.local` is gitignored; `.env.example` contains placeholders only.
 
 
