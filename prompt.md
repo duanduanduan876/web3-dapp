@@ -72,7 +72,7 @@ README.md                    ← 含运行/部署步骤与常见问题
 
 理解以上后，等待后续 Step 指令，并在每一步严格给出“文件变更摘要 + 文件树 + 主要代码片段 + 运行与验证步骤（DoD）”。
 
-现在准备好，请等待我发给你的第一步 Step 指令（后续我会一个 step 一个 step 地粘给你执行）。   【Step 1：初始化前端项目与辅助脚本】
+现在准备好，请等待我发给你的第一步 Step 指令（后续我会一个 step 一个 step 地粘给你执行）。【Step 1：初始化前端项目与辅助脚本】
 
 目标：
 在 `foundry-demo` 同级创建 `web3-dapp` 子目录并初始化 Next.js + Tailwind + shadcn/ui + wagmi + viem + RainbowKit + ECharts（全部 JS），并在项目根创建 scripts/export-abis.sh。
@@ -142,7 +142,7 @@ DoD（验收）：
 - 找到 script/Deploy.s.sol，包含部署并打印合约地址的逻辑；
 - 输出：变更摘要、contracts 目录树（含文件名）、关键代码片段（Token.sol、StakePool.sol 函数签名）、运行与验证命令（forge build、forge script 示例）、建议 commit message。
 
-建议 commit message: feat(contract): add core contracts + deploy script   【Step 3：实现 Next.js server API（app/api）】
+建议 commit message: feat(contract): add core contracts + deploy script【Step 3：实现 Next.js server API（app/api）】
 
 目标：
 在 `web3-dapp/app/api/` 下实现如下真实可调用的 route handlers（JS）：
@@ -209,7 +209,7 @@ DoD（验收）：
   - 访问 /swap，选择 token，尝试报价（若链上实际合约未部署则 API 返回 mock price，页面仍工作）；
   - 访问 /dashboard，页面能渲染 ECharts 图表（即便数据源为 api 返回的模拟 series）；
 - 输出：每个页面的文件名、关键代码片段（例如 Swap 页面中调用 getAmountsOut 的实现、ApproveButton 关键函数）、测试步骤与截图/交互预期描述；
-- 建议 commit message: feat(web): add pages swap/pool/farm/launchpad/bridge/dashboard 
+- 建议 commit message: feat(web): add pages swap/pool/farm/launchpad/bridge/dashboard
 
 
 
@@ -285,13 +285,13 @@ DoD：
 
 
 
-我发现项目整体已经完成了，我现在想做全流程测试，但是有几个地方不是很完善，需要做出调整： 1.目前REWARD_TOKEN、TOKEN_A、TOKEN_B、PAYMENT_TOKEN都是开源的，但是只能owner才可以mint，此项目是教学使用，这样不便于学员进行mint。要求修改这几个token合约的实现，仿照foundry-demo中的Web3FrontEndToken的实现，每个地址可以自己给自己mint，但是每个地址最多mint10万枚token，修改后把合约在sepolia上重新部署开源，把重新部署的合约地址和ABI全部更新到现在的前端项目中。 2.现在我在sepolia浏览器上看到的NEXT_PUBLIC_SWAP_ADDRESS、NEXT_PUBLIC_STAKE_POOL_ADDRESS、NEXT_PUBLIC_FARM_ADDRESS、NEXT_PUBLIC_LAUNCHPAD_ADDRESS是没有开源的，这样不符合教学要求，请把这几个前端项目中用到的合约全部开源。
-3.目前我发现web3-dapp前端项目中的public中ABI很多，有些在项目中并没有调用，请精简这些ABI，只保留在web3-dapp中调用的合约的ABI，模仿Uniswap前端项目管理ABI和合约地址的方式。 4.目前foundry-demo和web3-dapp中有许多执行任务过程中生成的各种总结类型的md文档，删除这些md文档，然后在web3-dapp中重新生成一份整体业务梳理的大而全的md文档，介绍这个项目该怎么使用，用户每一步应该怎么操作。
+我发现项目整体已经完成了，我现在想做全流程测试，但是有几个地方不是很完善，需要做出调整：1.目前REWARD_TOKEN、TOKEN_A、TOKEN_B、PAYMENT_TOKEN都是开源的，但是只能owner才可以mint，此项目是教学使用，这样不便于学员进行mint。要求修改这几个token合约的实现，仿照foundry-demo中的Web3FrontEndToken的实现，每个地址可以自己给自己mint，但是每个地址最多mint10万枚token，修改后把合约在sepolia上重新部署开源，把重新部署的合约地址和ABI全部更新到现在的前端项目中。2.现在我在sepolia浏览器上看到的NEXT_PUBLIC_SWAP_ADDRESS、NEXT_PUBLIC_STAKE_POOL_ADDRESS、NEXT_PUBLIC_FARM_ADDRESS、NEXT_PUBLIC_LAUNCHPAD_ADDRESS是没有开源的，这样不符合教学要求，请把这几个前端项目中用到的合约全部开源。
+3.目前我发现web3-dapp前端项目中的public中ABI很多，有些在项目中并没有调用，请精简这些ABI，只保留在web3-dapp中调用的合约的ABI，模仿Uniswap前端项目管理ABI和合约地址的方式。4.目前foundry-demo和web3-dapp中有许多执行任务过程中生成的各种总结类型的md文档，删除这些md文档，然后在web3-dapp中重新生成一份整体业务梳理的大而全的md文档，介绍这个项目该怎么使用，用户每一步应该怎么操作。
 
 
 
 
-我发现项目整体已经完成了，我现在想做全流程测试,我已经给自己的账户mint了REWARD_TOKEN、TokenA、TokenB和PAYMENT_TOKEN。 但是我现在启动项目后，lunchpad、Bridge、Swap、Pool、Farm业务全部都是显示模拟模式已激活。我想在已经部署的sepolia链上，测试这几个业务。之前已经让你把这几个业务涉及的合约都添加到对应的环境变量文件.env.local中了。 现在告诉我应该如何关闭模拟模式，调用真实的sepolia链上的ABI。 然后告诉我应该按什么顺序步骤来一步步测试这些合约是否正确生效，前端是否能正确调用这些合约。   嗯，我发现现在添加流动性失败了，我猜测是因为添加流动性的合约已经部署完成了，但是swap合约是后部署的，所以无法在添加流动性后自动给用户发放LP Token，是否需要重新写一个添加流动性的合约？如果需要的话，重新编写这个合约然后部署到sepolia上，然后更新所有用到了这个合约的地方。 还有个问题，我发现现在每次添加流动性都需要分别approve Token A和Token B，但是每次approve都显示无上限，是否可以改进这里，参考uniswap V2的做法？ 我的理解是如果approve过一次无上限，在下次添加流动性的时候就不需要approve这种token了。
+我发现项目整体已经完成了，我现在想做全流程测试,我已经给自己的账户mint了REWARD_TOKEN、TokenA、TokenB和PAYMENT_TOKEN。但是我现在启动项目后，lunchpad、Bridge、Swap、Pool、Farm业务全部都是显示模拟模式已激活。我想在已经部署的sepolia链上，测试这几个业务。之前已经让你把这几个业务涉及的合约都添加到对应的环境变量文件.env.local中了。现在告诉我应该如何关闭模拟模式，调用真实的sepolia链上的ABI。然后告诉我应该按什么顺序步骤来一步步测试这些合约是否正确生效，前端是否能正确调用这些合约。嗯，我发现现在添加流动性失败了，我猜测是因为添加流动性的合约已经部署完成了，但是swap合约是后部署的，所以无法在添加流动性后自动给用户发放LP Token，是否需要重新写一个添加流动性的合约？如果需要的话，重新编写这个合约然后部署到sepolia上，然后更新所有用到了这个合约的地方。还有个问题，我发现现在每次添加流动性都需要分别approve Token A和Token B，但是每次approve都显示无上限，是否可以改进这里，参考uniswap V2的做法？ 我的理解是如果approve过一次无上限，在下次添加流动性的时候就不需要approve这种token了。
 
 
 
