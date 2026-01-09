@@ -73,6 +73,29 @@
 
 > 如果现场 faucet / gas / RPC 限流导致操作失败：直接看 `docs/proofs.md`，每条 tx 都写清楚“证明了什么”。
 
+## Vercel 说明（Bridge Relayer）
+
+本项目的跨链桥（OP Sepolia → Sepolia）在“目标链 mint”这一步使用了 **部署在 Vercel 上的 Serverless Relayer**。
+由于 Serverless **不是常驻进程**，所以采用 **“请求驱动的 API”** 来完成 relayer 工作，而不是后台一直监听链上事件。
+
+### Vercel Serverless 的限制
+- **不能后台常驻监听**：无法长期运行进程去持续订阅/监听链上事件。
+- **有执行超时**：不适合在一次请求里长时间轮询或阻塞等待。
+- **没有本地状态持久化**：不能依赖内存保存 transfer 状态（需要 KV/DB，或采用“无状态：直接查链上”的方式）。
+- **私钥只能放在服务端环境变量**：relayer 私钥存放在 Vercel Env（只能用测试用 burner key）。
+
+### 可行实现
+1. **前端（OP Sepolia）** 发起源链跨链交易，拿到 `sourceTxHash`。
+2. **前端** 调用 `POST /api/bridge/relay`，把下面参数传给后端：
+   - `sourceTxHash`
+   - `recipient`
+   - `amount`
+3. **后端 API（Vercel Serverless）** 做两件事：
+   - 查询 OP Sepolia 的交易 `receipt`，从日志里解析出 `transferId`
+   - 使用 relayer 私钥调用 Sepolia 的 `TargetBridge` 执行 mint，并返回 `targetTxHash`
+4. **前端** 轮询 `GET /api/bridge/status?transferId=...`（无状态查询）：
+   - 直接在 Sepolia 链上查 mint 相关事件/receipt，更新 UI 状态（`queued / inflight / complete / failed`）
+
 ---
 
 ## 链上证明（On-chain Proofs）
