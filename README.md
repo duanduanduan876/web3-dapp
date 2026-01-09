@@ -3,6 +3,9 @@
 **在线演示（Live Demo）：** https://web3-dapp-two.vercel.app/  
 **链上证明（On-chain Proofs）：** `docs/proofs.md`
 
+Architecture: docs/ARCHITECTURE.md
+Known Issues: docs/KNOWN_ISSUES.md
+
 一个偏工程化落地的 Web3 DApp 项目集合，包含 **Swap/Pool（AMM）**、**Farm（质押挖矿）**、**Launchpad（IDO）**、**Bridge（OP Sepolia → Sepolia）** 四个模块。  
 重点：链上交互闭环、交易生命周期 UI 建模、轮询并发控制（in-flight）、基于 receipt/event 的进度驱动、可复现链上证据。
 
