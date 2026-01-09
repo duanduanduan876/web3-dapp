@@ -8,7 +8,7 @@
 
 ---
 
-## 亮点（面试官看点）
+## 关键实现点
 - **交易生命周期 UI 建模**：submit → confirming → success / fail（各模块一致）
 - **轮询并发控制**：in-flight 防重复请求 + AbortController 避免卸载后回写
 - **Bridge 事件驱动闭环**：源链 tx → 后端解析 receipt/event → transferId → 目标链 mint → 前端状态机轮询
@@ -77,7 +77,7 @@
 
 ## 链上证明（On-chain Proofs）
 - 合约地址与代表性交易哈希见：`docs/proofs.md`
-- 每条交易都附一句话用途说明（面试友好）
+- 每条交易附用途说明，便于复现与核验
 
 ---
 
