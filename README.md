@@ -92,9 +92,9 @@
 ## 本地运行（Running Locally）
 
 ### 1）安装依赖
-` ```bash`
-`npm i`
-` ``` `
+```bash
+npm i
+
 
 
 
