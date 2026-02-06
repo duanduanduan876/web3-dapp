@@ -156,10 +156,9 @@ function lsLoadTransfers(): TransferItem[] {
 
 // --- 3. 错误分类与 API 助手 ---
 
-//自定义错误类型
 class ApiError extends Error {
-  code?: string//定义一个字符串类型的“业务错误码
-  status?: number//定义一个数字类型的“HTTP 状态码”
+  code?: string
+  status?: number
   constructor(message: string, opts?: { code?: string; status?: number }) {
     super(message)
     this.name = 'ApiError'
@@ -286,7 +285,6 @@ export default function BridgePage() {
   const [isLoading, setIsLoading] = useState(false)
   const [isSuccess, setIsSuccess] = useState(false)
   const [sourceTxHash, setSourceTxHash] = useState<Hex | null>(null)
-  const [permitExpired, setPermitExpired] = useState(false)
 
   // 恢复历史记录
   useEffect(() => {
@@ -298,11 +296,9 @@ export default function BridgePage() {
     if (address && !recipient) setRecipient(address)
   }, [address, recipient])
 
-  // Section D：修正同步逻辑
+  // 同步修正逻辑
   const patch = useCallback((id: string, patchObj: Partial<TransferItem>) => {
-    // 1. 同步内存 UI
     setItems((prev) => prev.map((x) => (x.transferId === id ? { ...x, ...patchObj } : x)))
-    // 2. 同步存储 LocalStorage
     lsPatchTransfer(id, patchObj)
   }, [])
 
@@ -316,7 +312,7 @@ export default function BridgePage() {
     }
   }
 
-  // Section A 修复：去掉 chainId，由 Wagmi 自动处理或传 chain 对象
+  // 无限授权逻辑
   const handleApproveIfNeeded = async (amountWei: bigint) => {
     if (!address || !tokenA || !sourceBridge || !isAddress(tokenA) || !isAddress(sourceBridge)) return
 
@@ -333,10 +329,9 @@ export default function BridgePage() {
     })
   }
 
-  // Section F 修复：Wagmi v2 传参优化
+  // 核心跨链函数
   const handleBridge = async () => {
     setError(null)
-    setPermitExpired(false)
     setIsSuccess(false)
     setIsLoading(false)
     setSourceTxHash(null)
@@ -352,10 +347,10 @@ export default function BridgePage() {
 
       const amountWei = parseUnits(amount, DECIMALS)
 
-      // 1. 授权
+      // 1. 授权（采用无限授权模式）
       await handleApproveIfNeeded(amountWei)
 
-      // 2. 跨链调用
+      // 2. 发起跨链调用
       const txHash = await writeContractAsync({
         account: address as Address,
         chain: optimismSepolia,
@@ -369,7 +364,7 @@ export default function BridgePage() {
       setSourceTxHash(txHash)
       setBusy(false)
 
-      // 3. 提交后端入库
+      // 3. 提交至后端入库
       setIsLoading(true)
       const res = await fetch('/api/bridge/transfer', {
         method: 'POST',
@@ -378,7 +373,7 @@ export default function BridgePage() {
       })
       const data = await fetchJsonOrThrow(res)
 
-      // 4. Section E：入库并同步 LS
+      // 4. 入库并同步本地存储
       const newItem = data as TransferItem
       lsUpsertTransfer(newItem)
       setItems((prev) => [newItem, ...prev.filter((x) => x.transferId !== newItem.transferId)])
@@ -387,9 +382,6 @@ export default function BridgePage() {
     } catch (err: any) {
       if (isUserRejected(err)) {
         setError('你取消了钱包请求')
-      } else if (err instanceof ApiError && err.code === 'PERMIT_EXPIRED') {
-        setPermitExpired(true)
-        setError('授权签名已过期，请重新提交')
       } else {
         setError(toUiErrorMessage(err))
       }
@@ -428,7 +420,6 @@ export default function BridgePage() {
         <p className="text-gray-500 mb-8 text-sm">安全转移你的 Sepolia TKA 代币</p>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* 左侧：表单 */}
           <div className="lg:col-span-2 space-y-6">
             <div className="bg-white rounded-xl shadow-sm border p-6">
               <div className="mb-6 grid grid-cols-2 gap-4">
@@ -457,17 +448,10 @@ export default function BridgePage() {
                 <button onClick={handleBridge} disabled={busy || isLoading} className="w-full bg-blue-600 text-white py-4 rounded-lg font-bold hover:bg-blue-700 disabled:bg-gray-300">
                   {isLoading ? '后端入库中...' : busy ? '处理中...' : '发起跨链'}
                 </button>
-
-                {permitExpired && (
-                  <button onClick={() => handleBridge()} className="w-full bg-orange-500 text-white py-4 rounded-lg font-bold animate-bounce">
-                    重新提交
-                  </button>
-                )}
               </div>
             </div>
           </div>
 
-          {/* 右侧：记录 */}
           <div className="lg:col-span-1">
             <h2 className="text-xl font-bold mb-4">历史记录</h2>
             <div className="space-y-3 max-h-[700px] overflow-y-auto pr-2">
