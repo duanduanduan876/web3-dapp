@@ -19,6 +19,7 @@ export const dynamic = 'force-dynamic'
 
 type Status = 'queued' | 'inflight' | 'complete' | 'failed'
 
+//后端保存一条记录
 type TransferRec = {
   transferId: Hex
   status: Status
@@ -234,58 +235,106 @@ export async function POST(req: Request) {
       )
     }
 
-    // 5) 入库
-    const transferId = evt.transferId
-    const rec: TransferRec = {
-      transferId,
-      status: 'queued',
-      progress: 30,
-      sourceTxHash,
-      targetTxHash: null,
-      createdAt: Date.now(),
-    }
-    store.set(transferId, rec)
+    // ---------------------------------------------------------
+  // 5) 入库 & 快速返回 (主线程逻辑)
+  // ---------------------------------------------------------
+  const transferId = evt.transferId
 
-    // 6) 目标链 mint
-    if (!TARGET_BRIDGE_ADDRESS) throw new Error('缺少 TARGET_BRIDGE_ADDRESS')
-    assertAddress(TARGET_BRIDGE_ADDRESS, 'TARGET_BRIDGE_ADDRESS')
+  // 先检查配置，如果没有配置直接报错，不要等到后台任务才发现
+  if (!TARGET_BRIDGE_ADDRESS) throw new Error('缺少 TARGET_BRIDGE_ADDRESS')
+  assertAddress(TARGET_BRIDGE_ADDRESS, 'TARGET_BRIDGE_ADDRESS')
 
-    rec.status = 'inflight'
-    rec.progress = 70
-    store.set(transferId, rec)
-
-    const targetTxHash = await getSepoliaWallet().writeContract({
-      address: TARGET_BRIDGE_ADDRESS,
-      abi: TARGET_BRIDGE_ABI,
-      functionName: 'mintFromSource',
-      args: [transferId, evt.recipient, evt.amount],
-    })
-
-    rec.targetTxHash = targetTxHash
-    store.set(transferId, rec)
-
-    await getSepoliaPublic().waitForTransactionReceipt({
-      hash: targetTxHash,
-      confirmations: 1,
-      timeout: 180_000,
-      pollingInterval: 1500,
-    })
-
-    rec.status = 'complete'
-    rec.progress = 100
-    store.set(transferId, rec)
-
-    return json({ success: true, ...rec })
-  } catch (e: any) {
-    return json(
-      {
-        success: false,
-        error: e?.message || String(e),
-        stack: e?.stack || null,
-      },
-      { status: 500 },
-    )
+  // 初始化记录：状态为 queued (30%)
+  // 注意：这里我们创建一个基础对象，后续更新时建议拷贝新对象写入 store，避免引用污染
+  let rec: TransferRec = {
+    transferId,
+    status: 'queued',
+    progress: 30,
+    sourceTxHash,
+    targetTxHash: null,
+    createdAt: Date.now(),
   }
+  
+  // 写入存储
+  store.set(transferId, rec)
+
+  // ---------------------------------------------------------
+  // 6) 启动后台任务 (Fire and Forget)
+  // ---------------------------------------------------------
+  // 关键点：这里没有 await，也没有把这个 Promise 返回给前端
+  // 而是开启一个独立的异步执行流
+  ;(async () => {
+    try {
+      console.log(`[Background] 开始处理 Mint: ${transferId}`)
+
+      // --- 阶段 A: 准备 Mint (70%) ---
+      rec = { ...rec, status: 'inflight', progress: 70 }
+      store.set(transferId, rec)
+
+      const targetTxHash = await getSepoliaWallet().writeContract({
+        address: TARGET_BRIDGE_ADDRESS,
+        abi: TARGET_BRIDGE_ABI,
+        functionName: 'mintFromSource',
+        args: [transferId, evt.recipient, evt.amount],
+      })
+
+      // 记录 Hash
+      rec = { ...rec, targetTxHash }
+      store.set(transferId, rec)
+      console.log(`[Background] Mint 交易已发送: ${targetTxHash}`)
+
+      // --- 阶段 B: 等待交易确认 ---
+      await getSepoliaPublic().waitForTransactionReceipt({
+        hash: targetTxHash,
+        confirmations: 1,
+        timeout: 180_000, // 3分钟超时
+        pollingInterval: 3000,
+      })
+
+      // --- 阶段 C: 完成 (100%) ---
+      rec = { ...rec, status: 'complete', progress: 100 }
+      store.set(transferId, rec)
+      console.log(`[Background] Mint 完成: ${transferId}`)
+
+    } catch (err: any) {
+      // --- 异常处理 ---
+      // 这里的错误前端是收不到 HTTP 500 的（因为请求早就返回了）
+      // 所以必须手动把数据库状态改为 failed，这样前端轮询时才知道出错了
+      //第二次捕获，异步阶段，链上交易失败、Gas 不足、等待超时
+      console.error(`[Background] Mint 失败: ${transferId}`, err)
+      
+      rec = { 
+        ...rec, 
+        status: 'failed', 
+        error: err?.message || String(err) 
+      }
+      store.set(transferId, rec)
+    }
+  })()
+
+  // ---------------------------------------------------------
+  // 7) 立即向前端返回响应
+  // ---------------------------------------------------------
+  // 前端收到这个响应后，会拿到 transferId，然后开始轮询 GET 接口查进度
+  return json({ 
+    success: true, 
+    transferId, 
+    status: 'queued',
+    message: 'Request accepted. Processing in background.' 
+  })
+
+} catch (e: any) {
+  // 这里捕获的是步骤 5 (入库) 或前面的同步错误
+  //外层捕获的是同步的错误，参数缺失、配置错误、数据库坏了
+  return json(
+    {
+      success: false,
+      error: e?.message || String(e),
+      stack: e?.stack || null,
+    },
+    { status: 500 },
+  )
+}
 }
 
 export async function GET(req: Request) {

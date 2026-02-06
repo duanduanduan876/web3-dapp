@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { RainbowKitProvider } from '@rainbow-me/rainbowkit'
 import { config } from '../lib/wagmiClient'
 import Navbar from '../components/Navbar'
-
+import WagmiDebug from '../components/WagmiDebug'
 
 
 const queryClient = new QueryClient()
@@ -17,6 +17,7 @@ export default function Providers({ children }) {
         <RainbowKitProvider>
           {/* 这里渲染 Navbar，保证在 WagmiProvider + RainbowKitProvider 里面 */}
           <Navbar />
+          <WagmiDebug />
           {children}
         </RainbowKitProvider>
       </QueryClientProvider>
