@@ -65,7 +65,7 @@
 - **刷新恢复**：使用 localStorage 保存最近 N 条 `transferId`，刷新后自动恢复列表并继续轮询
 - **后端 quick return**：先入库返回 `transferId`，mint 与回执确认在后台异步执行，持续更新状态
 
-#### Vercel Relayer 说明（面试官关心的点）
+#### Vercel Relayer 说明
 - Relayer 运行在 Vercel Serverless 上，适合“请求触发式执行”
 - Serverless 会冷启动，内存状态不保证持久化，跨链记录持久化策略见 `docs/KNOWN_ISSUES.md`
 - Relayer 私钥仅存放在服务端环境变量中（测试用 burner key）
