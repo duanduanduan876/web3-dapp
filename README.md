@@ -53,11 +53,19 @@ Known Issues: docs/KNOWN_ISSUES.md
 - approve → contribute → claim 顺序校验与兜底提示
 
 ### Bridge（OP Sepolia → Sepolia）
-- OP Sepolia 发起 approve + bridge（burn/lock + event）
-- 后端解析 receipt/event 生成 transferId
-- relayer 在 Sepolia mint
-- 前端状态机：queued / inflight / complete / failed
+这是一个基于 源链事件 + 后端解析回执 + Relayer 铸币 的最小跨链 Demo。用户在 OP Sepolia 发起交易并 burn 代币，后端解析源链 receipt/logs 生成 transferId 并建档，Relayer 在 Sepolia 执行 mintFromSource 完成目标链铸币。前端用状态机展示跨链进度并支持刷新恢复。
 
+流程
+OP Sepolia：如有需要先 approve，再调用 bridge(amount, recipient, dstChainId)，在源链 burn 并发出事件
+后端：等待源链交易回执，解析事件参数，生成 transferId，创建一条跨链记录
+Relayer（后端）：在 Sepolia 发起目标链交易 mintFromSource(transferId, recipient, amount)，并写入 targetTxHash
+前端：轮询 /api/bridge/transfer?transferId=...，驱动状态机展示进度：queued → inflight → complete / failed
+
+实现要点
+前端状态机：queued / inflight / complete / failed，配合 progress 百分比展示
+轮询并发控制：in-flight guard + AbortController，避免重复请求和组件卸载后的状态更新
+刷新恢复：使用 localStorage 保存最近 N 条 transferId 与记录详情，刷新后自动恢复列表并继续轮询
+后端 quick return：先入库返回 transferId，Relayer 在后台异步执行 mint 与回执确认，持续更新进度与错误信息
 ---
 
 ## 3 分钟体验（How to Try）
