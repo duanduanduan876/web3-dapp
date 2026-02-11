@@ -124,5 +124,5 @@ npm i
 // 本地提交训练
 
 ## Conflict Training Block
-Line: KEEP_THIS_LINE
+Line: REMOTE_CHANGED_LINE
 
