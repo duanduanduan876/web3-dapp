@@ -16,6 +16,7 @@ import { parseUnits, formatUnits } from '../../lib/utils/units'
 import ApproveButton from '../../components/ApproveButton'
 import { TOKENS, getTokenAddress, getProtocolAddress } from '../../lib/constants'
 import { SWAP_ABI } from '../../lib/abis'
+import { sepolia } from 'viem/chains'
 
 const ERC20_ABI = [
   {
@@ -341,6 +342,7 @@ export default function SwapPage() {
       setTxHash(null)
 
       const h = await writeContractAsync({
+        chain: sepolia,
         chainId: SUPPORTED_CHAIN_ID,
         account: address as Address,
         address: swapAddress as Address,
