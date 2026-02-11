@@ -1,4 +1,4 @@
-# Web3 DApp 套件（DeFi + Bridge）| Next.js + wagmi/viem
+﻿# Web3 DApp 套件（DeFi + Bridge）| Next.js + wagmi/viem
 
 **在线演示（Live Demo）：** https://web3-dapp-two.vercel.app/  
 **链上证明（On-chain Proofs）：** `docs/proofs.md`  
@@ -117,4 +117,7 @@ npm i
 
 
 
+
 //段振江真帅
+<!-- local wip: 15:58:23 -->
+
