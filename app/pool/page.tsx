@@ -1,200 +1,189 @@
 'use client'
 
-
-import { useState, useEffect } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi'
 import { useChainId } from 'wagmi'
+import { type Address, isAddress, zeroAddress } from 'viem'
+
 import { parseUnits, formatUnits } from '@/lib/utils/units'
 import ApproveButton from '@/components/ApproveButton'
-import { TOKENS, getTokenAddress, getProtocolAddress } from '@/lib/constants'
+import { getTokenAddress, getProtocolAddress } from '@/lib/constants'
 import { SWAP_ABI, ERC20_ABI } from '@/lib/abis'
-import { CloudCog } from 'lucide-react'
 
-/**
- * Pool Page (Liquidity Pool)
- *
- * Features:
- * - Add liquidity (proportional deposit of TokenA + TokenB)
- * - Remove liquidity (proportional withdrawal)
- * - Display TVL and reserves
- * - Dual token approval flow
- */
+import { sepolia } from 'viem/chains'
+
+
+function asAddress(v?: string | null): Address | undefined {
+  if (!v) return undefined
+  return isAddress(v) ? (v as Address) : undefined
+}
 
 export default function PoolPage() {
   const { address, isConnected } = useAccount()
   const chainId = useChainId()
-  const swapAddress = getProtocolAddress(chainId, 'SWAP')
+
+  // 关键：把 string | undefined 收敛成 Address | undefined
+  const swapAddress = useMemo(() => asAddress(getProtocolAddress(chainId, 'SWAP')), [chainId])
+  const tokenAAddress = useMemo(() => asAddress(getTokenAddress(chainId, 'TKA')), [chainId])
+  const tokenBAddress = useMemo(() => asAddress(getTokenAddress(chainId, 'TKB')), [chainId])
+
   const isMockMode = !swapAddress
 
-
-  console.log('chainId =', chainId)
-console.log('swapAddress =', swapAddress)
-
-  // 获取代币地址
-  const tokenAAddress = getTokenAddress(chainId, 'TKA')
-  const tokenBAddress = getTokenAddress(chainId, 'TKB')
-
   // State
-  const [mode, setMode] = useState('add') // 'add' or 'remove'
+  const [mode, setMode] = useState<'add' | 'remove'>('add')
   const [amountA, setAmountA] = useState('')
   const [amountB, setAmountB] = useState('')
   const [lpAmount, setLpAmount] = useState('')
-  const [poolData, setPoolData] = useState(null)
-  const [tokenAApproved, setTokenAApproved] = useState(false)
+  const [poolData, setPoolData] = useState<any>(null)
 
-  // Read reserves from chain
-  const { data: reserves, isError: reservesError } = useReadContract({
-  address: swapAddress,
-  abi: SWAP_ABI,
-  functionName: 'getReserves',
-  enabled: Boolean(swapAddress),
-})
+  // ===== Reads (wagmi v2: 用 query.enabled) =====
 
-
-  // Read user LP token balance
-  const { data: lpBalance } = useReadContract({
-    address: swapAddress,
-    abi: SWAP_ABI,
-    functionName: 'balanceOf',
-    args: address ? [address] : undefined,
-    enabled: Boolean(swapAddress && address)
+  // Reserves
+  const { data: reservesRaw, isError: reservesError } = useReadContract({
+    // 给一个兜底 Address，配合 query.enabled=false 不会真的去读
+    address: (swapAddress ?? zeroAddress) as Address,
+    abi: SWAP_ABI as any,
+    functionName: 'getReserves',
+    query: {
+      enabled: Boolean(swapAddress),
+    },
   })
+  const reserves = reservesRaw as readonly [bigint, bigint] | undefined
 
-  // Read user token balances
-  const { data: balanceTKA } = useReadContract({
-    address: tokenAAddress,
-    abi: ERC20_ABI,
+  // LP balance (如果你的 Swap 合约本身是 LP ERC20，这样读才成立)
+  const { data: lpBalanceRaw } = useReadContract({
+    address: (swapAddress ?? zeroAddress) as Address,
+    abi: SWAP_ABI as any,
     functionName: 'balanceOf',
-    args: address ? [address] : undefined,
-    enabled: Boolean(tokenAAddress && address)
+    args: address ? [address as Address] : undefined,
+    query: {
+      enabled: Boolean(swapAddress && address),
+    },
   })
+  const lpBalance = lpBalanceRaw as bigint | undefined
 
-  const { data: balanceTKB } = useReadContract({
-    address: tokenBAddress,
-    abi: ERC20_ABI,
+  // Token balances
+  const { data: balanceTKARaw } = useReadContract({
+    address: (tokenAAddress ?? zeroAddress) as Address,
+    abi: ERC20_ABI as any,
     functionName: 'balanceOf',
-    args: address ? [address] : undefined,
-    enabled: Boolean(tokenBAddress && address)
+    args: address ? [address as Address] : undefined,
+    query: {
+      enabled: Boolean(tokenAAddress && address),
+    },
   })
-    console.log('reserves =', reserves, 'reservesError =', reservesError)
-  
-  //解构赋值（destructuring） + 重命名（alias）
-  //广播成功，hash会出现
-  // Add liquidity transaction
+  const balanceTKA = balanceTKARaw as bigint | undefined
 
-  //发交易阶段
+  const { data: balanceTKBRaw } = useReadContract({
+    address: (tokenBAddress ?? zeroAddress) as Address,
+    abi: ERC20_ABI as any,
+    functionName: 'balanceOf',
+    args: address ? [address as Address] : undefined,
+    query: {
+      enabled: Boolean(tokenBAddress && address),
+    },
+  })
+  const balanceTKB = balanceTKBRaw as bigint | undefined
+
+  // ===== Writes =====
   const { data: addHash, writeContract: addLiquidity, isPending: isAdding } = useWriteContract()
-  
-  //链上确认阶段
   const { isLoading: isAddConfirming, isSuccess: isAddSuccess } = useWaitForTransactionReceipt({
-    hash: addHash
+    hash: addHash,
   })
 
-  // Remove liquidity transaction
   const { data: removeHash, writeContract: removeLiquidity, isPending: isRemoving } = useWriteContract()
-
   const { isLoading: isRemoveConfirming, isSuccess: isRemoveSuccess } = useWaitForTransactionReceipt({
-    hash: removeHash
+    hash: removeHash,
   })
 
   // Fetch pool data from API
   useEffect(() => {
     fetch('/api/stake/pools')
-      .then(res => res.json())
-      .then(data => setPoolData(data))
-      .catch(console.error) 
+      .then((res) => res.json())
+      .then((data) => setPoolData(data))
+      .catch(console.error)
   }, [])
 
-  
-
-  // Auto-calculate amountB when amountA changes (proportional)
+  // Auto-calc amountB
   useEffect(() => {
-    if (mode !== 'add' || !amountA || parseFloat(amountA) <= 0) {
-      return
-    }
+    if (mode !== 'add' || !amountA || Number(amountA) <= 0) return
 
     if (reserves && reserves[0] > 0n && reserves[1] > 0n) {
-      // Use actual reserves ratio
       const reserveA = Number(reserves[0]) / 1e18
       const reserveB = Number(reserves[1]) / 1e18
       const ratio = reserveB / reserveA
-      const calculatedB = parseFloat(amountA) * ratio
-      setAmountB(calculatedB.toFixed(6))
-    } else {  
-      // Mock: use 1:1.5 ratio
-      const calculatedB = parseFloat(amountA) * 1.5
-      setAmountB(calculatedB.toFixed(6))
+      setAmountB((Number(amountA) * ratio).toFixed(6))
+      return
     }
+
+    setAmountB((Number(amountA) * 1.5).toFixed(6))
   }, [amountA, reserves, mode])
 
-  // Calculate proportional amounts when removing liquidity
+  // Remove calc
   const calculateRemoveAmounts = () => {
-    if (!lpAmount || parseFloat(lpAmount) <= 0 || !reserves || !lpBalance) {
+    if (!lpAmount || Number(lpAmount) <= 0 || !reserves || !lpBalance) {
       return { amountA: '0', amountB: '0' }
     }
 
-    const lpAmountBig = parseUnits(lpAmount, 18)
-    const lpBalanceBig = BigInt(lpBalance)
+    const lpAmountWei = parseUnits(lpAmount, 18) as bigint
+    if (lpAmountWei > lpBalance) return { amountA: '0', amountB: '0' }
 
-    if (lpAmountBig > lpBalanceBig) {
-      return { amountA: '0', amountB: '0' }
-    }
+    const amountAWei = (lpAmountWei * reserves[0]) / lpBalance
+    const amountBWei = (lpAmountWei * reserves[1]) / lpBalance
 
-    // Calculate proportional amounts
-    const reserveA = BigInt(reserves[0])
-    const reserveB = BigInt(reserves[1])
-
-    // Simple calculation: (lpAmount / lpBalance) * reserve
-    const amountABig = (lpAmountBig * reserveA) / lpBalanceBig
-    const amountBBig = (lpAmountBig * reserveB) / lpBalanceBig
-
-    return {  
-      amountA: formatUnits(amountABig, 18, 6),
-      amountB: formatUnits(amountBBig, 18, 6)
+    return {
+      amountA: formatUnits(amountAWei, 18, 6),
+      amountB: formatUnits(amountBWei, 18, 6),
     }
   }
 
   const removeAmounts = calculateRemoveAmounts()
 
   const handleAddLiquidity = () => {
-    if (!swapAddress || !amountA || !amountB) return
+    if (!swapAddress) return
+    if (!amountA || !amountB) return
 
-    const amountAWei = parseUnits(amountA, 18)
-    const amountBWei = parseUnits(amountB, 18)
+    const amountAWei = parseUnits(amountA, 18) as bigint
+    const amountBWei = parseUnits(amountB, 18) as bigint
 
+    // add
     addLiquidity({
-      address: swapAddress,
-      abi: SWAP_ABI,
+      address: swapAddress as Address,
+      abi: SWAP_ABI as any,
       functionName: 'addLiquidity',
-      args: [amountAWei, amountBWei]
+      args: [amountAWei, amountBWei] as const,
+      account: address as Address,
+      chain: sepolia,
     })
-  }
+  } // <--- 修改点 1：补上这个括号，闭合 handleAddLiquidity
 
   const handleRemoveLiquidity = () => {
-    if (!swapAddress || !lpAmount) return
+    if (!swapAddress) return
+    if (!lpAmount) return
 
-    const lpAmountWei = parseUnits(lpAmount, 18)
+    const lpAmountWei = parseUnits(lpAmount, 18) as bigint
 
     removeLiquidity({
-      address: swapAddress,
-      abi: SWAP_ABI,
+      address: swapAddress as Address,
+      abi: SWAP_ABI as any,
       functionName: 'removeLiquidity',
-      args: [lpAmountWei]
+      args: [lpAmountWei] as const,
+      account: address as Address,
+      chain: sepolia,
     })
   }
-
   const handleMaxLP = () => {
-    if (lpBalance) {
-      setLpAmount(formatUnits(lpBalance, 18, 6))
-    }
+    if (lpBalance) setLpAmount(formatUnits(lpBalance, 18, 6))
   }
-
   const handleMaxTKA = () => {
-    if (balanceTKA) {
-      setAmountA(formatUnits(balanceTKA, 18, 6))
-    }
+    if (balanceTKA) setAmountA(formatUnits(balanceTKA, 18, 6))
   }
 
+  // 渲染层的 “能交互” 条件，保证 ApproveButton 的 props 传进去一定是 Address
+  const canInteract =
+    Boolean(isConnected && swapAddress && tokenAAddress && tokenBAddress) && !isMockMode
+
+// 1. 请确保删除了 return 之前的那个多余的 “}”
   return (
     <div className="container max-w-2xl mx-auto py-12">
       {/* Header */}
@@ -203,15 +192,12 @@ console.log('swapAddress =', swapAddress)
         <p className="text-gray-600">Add or remove liquidity to earn trading fees</p>
       </div>
 
-      {/* Pool Stats */}
+      {/* Stats */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
         <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-lg shadow-lg p-6 text-white">
           <div className="text-sm opacity-90 mb-1">Total TVL</div>
           <div className="text-2xl font-bold">
-            {poolData?.pools?.[0]?.tvl
-              ? `$${parseFloat(poolData.pools[0].tvl).toLocaleString()}`
-              : '$0'
-            }
+            {poolData?.pools?.[0]?.tvl ? `$${Number(poolData.pools[0].tvl).toLocaleString()}` : '$0'}
           </div>
         </div>
 
@@ -232,14 +218,12 @@ console.log('swapAddress =', swapAddress)
 
       {/* Main Card */}
       <div className="bg-white rounded-2xl shadow-lg p-6">
-        {/* Mode Selector */}
+        {/* Mode selector */}
         <div className="flex gap-2 mb-6">
           <button
             onClick={() => setMode('add')}
             className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${
-              mode === 'add'
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              mode === 'add' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
             }`}
           >
             Add Liquidity
@@ -247,15 +231,14 @@ console.log('swapAddress =', swapAddress)
           <button
             onClick={() => setMode('remove')}
             className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${
-              mode === 'remove'
-                ? 'bg-blue-600 text-white'
-                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              mode === 'remove' ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
             }`}
           >
             Remove Liquidity
           </button>
         </div>
 
+        {/* Mock warning */}
         {isMockMode && (
           <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
             <p className="text-sm text-yellow-800">
@@ -264,10 +247,9 @@ console.log('swapAddress =', swapAddress)
           </div>
         )}
 
-        {/* Add Liquidity Mode */}
+        {/* Add mode */}
         {mode === 'add' && (
           <>
-            {/* Token A Input */}
             <div className="mb-4">
               <div className="bg-gray-50 rounded-xl p-4">
                 <div className="flex justify-between mb-2">
@@ -284,14 +266,11 @@ console.log('swapAddress =', swapAddress)
                     placeholder="0.0"
                     className="flex-1 text-2xl font-semibold bg-transparent outline-none"
                   />
-                  <div className="bg-white border rounded-lg px-3 py-2 font-semibold">
-                    TKA
-                  </div>
+                  <div className="bg-white border rounded-lg px-3 py-2 font-semibold">TKA</div>
                 </div>
               </div>
             </div>
 
-            {/* Plus Icon */}
             <div className="flex justify-center -my-2 relative z-10">
               <div className="bg-white border-4 border-gray-50 rounded-xl p-2">
                 <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -300,12 +279,14 @@ console.log('swapAddress =', swapAddress)
               </div>
             </div>
 
-            {/* Token B Input */}
             <div className="mb-6">
               <div className="bg-gray-50 rounded-xl p-4">
                 <div className="flex justify-between mb-2">
                   <label className="text-sm text-gray-600">Token B</label>
-                  <button onClick={() => balanceTKB && setAmountB(formatUnits(balanceTKB, 18, 6))} className="text-sm text-blue-600">
+                  <button
+                    onClick={() => balanceTKB && setAmountB(formatUnits(balanceTKB, 18, 6))}
+                    className="text-sm text-blue-600"
+                  >
                     Balance: {balanceTKB ? formatUnits(balanceTKB, 18, 4) : '0'}
                   </button>
                 </div>
@@ -317,52 +298,32 @@ console.log('swapAddress =', swapAddress)
                     placeholder="0.0"
                     className="flex-1 text-2xl font-semibold bg-transparent outline-none"
                   />
-                  <div className="bg-white border rounded-lg px-3 py-2 font-semibold">
-                    TKB
-                  </div>
+                  <div className="bg-white border rounded-lg px-3 py-2 font-semibold">TKB</div>
                 </div>
               </div>
             </div>
 
-            {/* Price Info */}
-            {amountA && amountB && (
-              <div className="mb-4 p-3 bg-blue-50 rounded-lg">
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-600">Rate</span>
-                  <span className="font-semibold">
-                    1 TKA = {(parseFloat(amountB) / parseFloat(amountA)).toFixed(4)} TKB
-                  </span>
-                </div>
-                <div className="flex justify-between text-sm mt-1">
-                  <span className="text-gray-600">Your Share</span>
-                  <span className="font-semibold">~0.1%</span>
-                </div>
-              </div>
-            )}
-
-            {/* Action Button - Add Liquidity with Dual Approval */}
             {!isConnected ? (
               <button className="w-full bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg">
                 Connect Wallet
               </button>
-            ) : !swapAddress || isMockMode ? (
+            ) : !canInteract ? (
               <button
                 disabled
                 className="w-full bg-gray-400 text-white font-semibold py-3 px-6 rounded-lg cursor-not-allowed"
               >
-                {isMockMode ? 'Add Liquidity (Mock Mode - Contract Not Deployed)' : 'Swap Contract Not Available'}
+                {isMockMode ? 'Add Liquidity (Mock Mode)' : 'Contract / Token address invalid'}
               </button>
             ) : (
               <ApproveButton
-                tokenAddress={tokenAAddress}
-                spenderAddress={swapAddress}
+                tokenAddress={tokenAAddress as any}
+                spenderAddress={swapAddress as any}
                 amount={amountA ? parseUnits(amountA, 18) : 0n}
-                onApproved={() => setTokenAApproved(true)}
                 disabled={!amountA || !amountB || isAdding || isAddConfirming}
               >
                 <ApproveButton
-                  tokenAddress={tokenBAddress}
-                  spenderAddress={swapAddress}
+                  tokenAddress={tokenBAddress as any}
+                  spenderAddress={swapAddress as any}
                   amount={amountB ? parseUnits(amountB, 18) : 0n}
                   disabled={!amountA || !amountB || isAdding || isAddConfirming}
                 >
@@ -377,7 +338,6 @@ console.log('swapAddress =', swapAddress)
               </ApproveButton>
             )}
 
-            {/* Success Message */}
             {isAddSuccess && (
               <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-lg">
                 <p className="text-green-800 font-semibold">Liquidity Added Successfully!</p>
@@ -394,10 +354,9 @@ console.log('swapAddress =', swapAddress)
           </>
         )}
 
-        {/* Remove Liquidity Mode */}
+        {/* Remove mode */}
         {mode === 'remove' && (
           <>
-            {/* LP Token Input */}
             <div className="mb-4">
               <div className="bg-gray-50 rounded-xl p-4">
                 <div className="flex justify-between mb-2">
@@ -414,14 +373,11 @@ console.log('swapAddress =', swapAddress)
                     placeholder="0.0"
                     className="flex-1 text-2xl font-semibold bg-transparent outline-none"
                   />
-                  <div className="bg-white border rounded-lg px-3 py-2 font-semibold">
-                    LP
-                  </div>
+                  <div className="bg-white border rounded-lg px-3 py-2 font-semibold">LP</div>
                 </div>
               </div>
             </div>
 
-            {/* Arrow Down */}
             <div className="flex justify-center -my-2 relative z-10">
               <div className="bg-white border-4 border-gray-50 rounded-xl p-2">
                 <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -430,7 +386,6 @@ console.log('swapAddress =', swapAddress)
               </div>
             </div>
 
-            {/* Output Amounts */}
             <div className="mb-6 space-y-3">
               <div className="bg-gray-50 rounded-xl p-4">
                 <div className="text-sm text-gray-600 mb-1">You will receive</div>
@@ -442,7 +397,6 @@ console.log('swapAddress =', swapAddress)
               </div>
             </div>
 
-            {/* Action Button */}
             {!isConnected ? (
               <button className="w-full bg-blue-600 text-white font-semibold py-3 px-6 rounded-lg">
                 Connect Wallet
@@ -452,7 +406,7 @@ console.log('swapAddress =', swapAddress)
                 disabled
                 className="w-full bg-gray-400 text-white font-semibold py-3 px-6 rounded-lg cursor-not-allowed"
               >
-                {isMockMode ? 'Remove Liquidity (Mock Mode - Contract Not Deployed)' : 'Swap Contract Not Available'}
+                {isMockMode ? 'Remove Liquidity (Mock Mode)' : 'Swap Contract Not Available'}
               </button>
             ) : (
               <button
@@ -464,7 +418,6 @@ console.log('swapAddress =', swapAddress)
               </button>
             )}
 
-            {/* Success Message */}
             {isRemoveSuccess && (
               <div className="mt-4 p-4 bg-green-50 border border-green-200 rounded-lg">
                 <p className="text-green-800 font-semibold">Liquidity Removed Successfully!</p>
@@ -482,16 +435,23 @@ console.log('swapAddress =', swapAddress)
         )}
       </div>
 
-      {/* Info Section */}
+      {/* Info */}
       <div className="mt-6 p-4 bg-gray-50 rounded-lg">
         <h3 className="font-semibold mb-2">How it works</h3>
         <ul className="text-sm text-gray-600 space-y-1">
-          <li>• Add liquidity in a 1:1 ratio to earn trading fees</li>
+          <li>• Add liquidity in a ratio based on reserves</li>
           <li>• Receive LP tokens representing your pool share</li>
           <li>• Remove liquidity anytime by burning LP tokens</li>
-          <li>• Earn 0.3% fee on all swaps proportional to your share</li>
+          <li>• Earn fee proportional to your share</li>
         </ul>
       </div>
+
+      {/* Reserves read error */}
+      {reservesError && (
+        <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg">
+          getReserves 读取失败。先确认 SWAP 地址和 ABI
+        </div>
+      )}
     </div>
-  )
-}
+  );
+} // 2. 这里补上最后一个收尾括号

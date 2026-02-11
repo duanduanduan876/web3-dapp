@@ -1,10 +1,13 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { useAccount, useReadContract } from 'wagmi'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { useAccount, useReadContract, useChainId } from 'wagmi'
+import { isAddress } from 'viem'
 import { formatUnits, formatUSD } from '@/lib/utils/units'
 import { formatNumber } from '@/lib/utils/format'
 import LineChartEcharts, { transformDataForEcharts, filterDataByDays } from '@/components/charts/LineChartEcharts'
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
 
 const ERC20_ABI = [
   {
@@ -12,15 +15,15 @@ const ERC20_ABI = [
     type: 'function',
     stateMutability: 'view',
     inputs: [{ name: 'account', type: 'address' }],
-    outputs: [{ name: '', type: 'uint256' }]
+    outputs: [{ name: '', type: 'uint256' }],
   },
   {
     name: 'symbol',
     type: 'function',
     stateMutability: 'view',
     inputs: [],
-    outputs: [{ name: '', type: 'string' }]
-  }
+    outputs: [{ name: '', type: 'string' }],
+  },
 ]
 
 const FARM_ABI = [
@@ -30,12 +33,12 @@ const FARM_ABI = [
     stateMutability: 'view',
     inputs: [
       { name: '', type: 'uint256' },
-      { name: '', type: 'address' }
+      { name: '', type: 'address' },
     ],
     outputs: [
       { name: 'amount', type: 'uint256' },
-      { name: 'rewardDebt', type: 'uint256' }
-    ]
+      { name: 'rewardDebt', type: 'uint256' },
+    ],
   },
   {
     name: 'pendingReward',
@@ -43,46 +46,110 @@ const FARM_ABI = [
     stateMutability: 'view',
     inputs: [
       { name: 'poolId', type: 'uint256' },
-      { name: 'user', type: 'address' }
+      { name: 'user', type: 'address' },
     ],
-    outputs: [{ name: '', type: 'uint256' }]
-  }
+    outputs: [{ name: '', type: 'uint256' }],
+  },
 ]
+
+function isRpcError(err) {
+  const msg = String(err?.message || '')
+  const low = msg.toLowerCase()
+  return (
+    low.includes('network') ||
+    low.includes('timeout') ||
+    low.includes('timed out') ||
+    low.includes('fetch') ||
+    low.includes('503') ||
+    low.includes('502') ||
+    low.includes('500')
+  )
+}
+
+function toUiMsg(err) {
+  if (!err) return '未知错误'
+  if (typeof err === 'string') return err
+  return String(err?.message || '未知错误')
+}
+
+async function fetchJson(url, signal) {
+  const res = await fetch(url, { signal })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`)
+  }
+  return await res.json()
+}
 
 export default function DashboardPage() {
   const { address, isConnected } = useAccount()
+  const chainId = useChainId()
+
+  const SUPPORTED_CHAIN_ID = 11155111
+  const chainOk = chainId === SUPPORTED_CHAIN_ID
+  const addrOk = !!address && isAddress(address)
+
   const [priceData, setPriceData] = useState(null)
   const [poolsData, setPoolsData] = useState(null)
   const [farmData, setFarmData] = useState(null)
-  const [priceDays, setPriceDays] = useState(7) // 价格图表时间范围
-  const [apyDays, setApyDays] = useState(30)    // APY 图表时间范围
 
-  const swapAddress = process.env.NEXT_PUBLIC_SWAP_ADDRESS
-  const farmAddress = process.env.NEXT_PUBLIC_FARM_ADDRESS
+  const [priceDays, setPriceDays] = useState(7)
+  const [apyDays, setApyDays] = useState(30)
+
+  // 6 abilities（同口径，dashboard 用于 API/读数据）
+  const [stage, setStage] = useState('idle') // idle → preparing → pendingWallet → confirming → success | failed
+  const [errType, setErrType] = useState(null) // 用户拒签 | RPC 错误 | 合约 revert | 未知
+  const [uiError, setUiError] = useState(null)
+
+  const inFlightRef = useRef(false)
+  const lastKickRef = useRef(0)
+
+  const swapAddressRaw = process.env.NEXT_PUBLIC_SWAP_ADDRESS
+  const farmAddressRaw = process.env.NEXT_PUBLIC_FARM_ADDRESS
+
+  const tokenARaw = process.env.NEXT_PUBLIC_TOKEN_A_ADDRESS
+  const tokenBRaw = process.env.NEXT_PUBLIC_TOKEN_B_ADDRESS
+  const rewardTokenRaw = process.env.NEXT_PUBLIC_REWARD_TOKEN_ADDRESS
+
+  const swapAddressOk = !!swapAddressRaw && isAddress(swapAddressRaw)
+  const farmAddressOk = !!farmAddressRaw && isAddress(farmAddressRaw)
+
+  const tokenAOk = !!tokenARaw && isAddress(tokenARaw)
+  const tokenBOk = !!tokenBRaw && isAddress(tokenBRaw)
+  const rewardTokenOk = !!rewardTokenRaw && isAddress(rewardTokenRaw)
+
+  const swapAddress = swapAddressOk ? swapAddressRaw : ZERO_ADDRESS
+  const farmAddress = farmAddressOk ? farmAddressRaw : ZERO_ADDRESS
+
+  const tokenA = tokenAOk ? tokenARaw : ZERO_ADDRESS
+  const tokenB = tokenBOk ? tokenBRaw : ZERO_ADDRESS
+  const rewardToken = rewardTokenOk ? rewardTokenRaw : ZERO_ADDRESS
+
+  const readEnabledBase = Boolean(isConnected && addrOk && chainOk)
 
   // Read token balances
   const { data: balanceTKA } = useReadContract({
-    address: process.env.NEXT_PUBLIC_TOKEN_A_ADDRESS,
+    address: tokenA,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
-    args: address ? [address] : undefined,
-    enabled: Boolean(address)
+    args: addrOk ? [address] : undefined,
+    query: { enabled: readEnabledBase && tokenAOk },
   })
 
   const { data: balanceTKB } = useReadContract({
-    address: process.env.NEXT_PUBLIC_TOKEN_B_ADDRESS,
+    address: tokenB,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
-    args: address ? [address] : undefined,
-    enabled: Boolean(address)
+    args: addrOk ? [address] : undefined,
+    query: { enabled: readEnabledBase && tokenBOk },
   })
 
   const { data: balanceDRT } = useReadContract({
-    address: process.env.NEXT_PUBLIC_REWARD_TOKEN_ADDRESS,
+    address: rewardToken,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
-    args: address ? [address] : undefined,
-    enabled: Boolean(address)
+    args: addrOk ? [address] : undefined,
+    query: { enabled: readEnabledBase && rewardTokenOk },
   })
 
   // Read LP Token balance (Swap contract is also LP token)
@@ -90,62 +157,58 @@ export default function DashboardPage() {
     address: swapAddress,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
-    args: address ? [address] : undefined,
-    enabled: Boolean(address && swapAddress)
+    args: addrOk ? [address] : undefined,
+    query: { enabled: readEnabledBase && swapAddressOk },
   })
 
-  // Read Farm Pool 0 user info
+  // Read Farm Pool user info
   const { data: farmPool0 } = useReadContract({
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'userInfo',
-    args: address ? [0n, address] : undefined,
-    enabled: Boolean(address && farmAddress)
+    args: addrOk ? [0n, address] : undefined,
+    query: { enabled: readEnabledBase && farmAddressOk },
   })
 
-  // Read Farm Pool 1 user info
   const { data: farmPool1 } = useReadContract({
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'userInfo',
-    args: address ? [1n, address] : undefined,
-    enabled: Boolean(address && farmAddress)
+    args: addrOk ? [1n, address] : undefined,
+    query: { enabled: readEnabledBase && farmAddressOk },
   })
 
-  // Read Farm Pool 2 user info
   const { data: farmPool2 } = useReadContract({
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'userInfo',
-    args: address ? [2n, address] : undefined,
-    enabled: Boolean(address && farmAddress)
+    args: addrOk ? [2n, address] : undefined,
+    query: { enabled: readEnabledBase && farmAddressOk },
   })
 
-  // Read pending rewards for Pool 0
+  // Read pending rewards
   const { data: pendingPool0 } = useReadContract({
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'pendingReward',
-    args: address ? [0n, address] : undefined,
-    enabled: Boolean(address && farmAddress)
+    args: addrOk ? [0n, address] : undefined,
+    query: { enabled: readEnabledBase && farmAddressOk },
   })
 
-  // Read pending rewards for Pool 1
   const { data: pendingPool1 } = useReadContract({
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'pendingReward',
-    args: address ? [1n, address] : undefined,
-    enabled: Boolean(address && farmAddress)
+    args: addrOk ? [1n, address] : undefined,
+    query: { enabled: readEnabledBase && farmAddressOk },
   })
 
-  // Read pending rewards for Pool 2
   const { data: pendingPool2 } = useReadContract({
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'pendingReward',
-    args: address ? [2n, address] : undefined,
-    enabled: Boolean(address && farmAddress)
+    args: addrOk ? [2n, address] : undefined,
+    query: { enabled: readEnabledBase && farmAddressOk },
   })
 
   // Calculate total LP holdings
@@ -154,7 +217,8 @@ export default function DashboardPage() {
   // Calculate total staked in farms
   const totalStaked = [farmPool0, farmPool1, farmPool2].reduce((sum, pool) => {
     if (!pool) return sum
-    return sum + Number(formatUnits(pool[0], 18, 6))
+    const amountWei = pool?.[0] ?? pool?.amount ?? 0n
+    return sum + Number(formatUnits(amountWei, 18, 6))
   }, 0)
 
   // Calculate total pending rewards
@@ -163,74 +227,106 @@ export default function DashboardPage() {
     return sum + Number(formatUnits(pending, 18, 6))
   }, 0)
 
-  // Fetch price data from API
-  useEffect(() => {
-    fetch('/api/token/price')
-      .then(res => res.json())
-      .then(data => setPriceData(data))
-      .catch(console.error)
-
-    fetch('/api/stake/pools')
-      .then(res => res.json())
-      .then(data => setPoolsData(data))
-      .catch(console.error)
-
-    fetch('/api/farm/stats')
-      .then(res => res.json())
-      .then(data => setFarmData(data))
-      .catch(console.error)
+  // clear / again
+  const clear = useCallback(() => {
+    setPriceData(null)
+    setPoolsData(null)
+    setFarmData(null)
+    setUiError(null)
+    setErrType(null)
+    setStage('idle')
   }, [])
 
-  // 准备价格图表数据（支持 7天/30天切换）
+  const loadAll = useCallback(async () => {
+    const now = Date.now()
+    // 防抖：300ms 内只允许一次
+    if (now - lastKickRef.current < 300) return
+    lastKickRef.current = now
+
+    // in-flight 禁用
+    if (inFlightRef.current) return
+    inFlightRef.current = true
+
+    setUiError(null)
+    setErrType(null)
+    setStage('preparing')
+
+    const controller = new AbortController()
+
+    try {
+      // 数据读写前置校验（dashboard 的版本：链、地址）
+      if (!chainOk) throw new Error('链不对：请切到 Sepolia')
+      if (!addrOk) throw new Error('地址不合法：请先连接钱包')
+      if (!swapAddressOk || !farmAddressOk) throw new Error('合约地址未配置或不合法')
+
+      setStage('confirming')
+
+      const [p, pools, farm] = await Promise.all([
+        fetchJson('/api/token/price', controller.signal),
+        fetchJson('/api/stake/pools', controller.signal),
+        fetchJson('/api/farm/stats', controller.signal),
+      ])
+
+      setPriceData(p)
+      setPoolsData(pools)
+      setFarmData(farm)
+
+      setStage('success')
+    } catch (e) {
+      const t = isRpcError(e) ? 'RPC 错误' : '未知'
+      setErrType(t)
+      setUiError(`${t}: ${toUiMsg(e)}`)
+      setStage('failed')
+    } finally {
+      inFlightRef.current = false
+    }
+
+    return () => controller.abort()
+  }, [addrOk, chainOk, farmAddressOk, swapAddressOk])
+
+  // 初次加载
+  useEffect(() => {
+    loadAll()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Charts data
   const priceChartData = priceData?.series
-    ? filterDataByDays(
-        transformDataForEcharts(priceData.series, 'ts', 'price'),
-        priceDays
-      )
+    ? filterDataByDays(transformDataForEcharts(priceData.series, 'ts', 'price'), priceDays)
     : []
 
-  // 准备 TVL 图表数据（合成各池 TVL 历史）
   const tvlChartData = poolsData?.pools
-    ? [{
-        name: 'Total TVL',
-        data: transformDataForEcharts(
-          poolsData.pools[0]?.history || [], // 使用第一个池的历史数据作为示例
-          'ts',
-          'tvl'
-        )
-      }]
+    ? [
+        {
+          name: 'Total TVL',
+          data: transformDataForEcharts(poolsData.pools[0]?.history || [], 'ts', 'tvl'),
+        },
+      ]
     : []
 
-  // 准备 APY 图表数据（支持 7天/30天切换）
   const apyChartSeries = farmData?.apyHistory
     ? [
         {
           name: 'Pool 0',
           data: filterDataByDays(
-            farmData.apyHistory
-              .filter(item => item.poolId === 0)
-              .map(item => [item.ts, item.apy]),
+            farmData.apyHistory.filter((item) => item.poolId === 0).map((item) => [item.ts, item.apy]),
             apyDays
-          )
+          ),
         },
         {
           name: 'Pool 1',
           data: filterDataByDays(
-            farmData.apyHistory
-              .filter(item => item.poolId === 1)
-              .map(item => [item.ts, item.apy]),
+            farmData.apyHistory.filter((item) => item.poolId === 1).map((item) => [item.ts, item.apy]),
             apyDays
-          )
+          ),
         },
         {
           name: 'Pool 2',
           data: filterDataByDays(
-            farmData.apyHistory
-              .filter(item => item.poolId === 2)
-              .map(item => [item.ts, item.apy]),
+            farmData.apyHistory.filter((item) => item.poolId === 2).map((item) => [item.ts, item.apy]),
             apyDays
-          )
-        }
+          ),
+        },
       ]
     : []
 
@@ -238,27 +334,27 @@ export default function DashboardPage() {
     <div className="container py-8">
       <h1 className="text-3xl font-bold mb-8">Dashboard</h1>
 
+      {uiError && (
+        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+          {uiError}
+        </div>
+      )}
+
       {/* Wallet Balances */}
       {isConnected && (
         <>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
             <div className="bg-white rounded-lg shadow p-6">
               <div className="text-sm text-gray-600 mb-1">Token A Balance</div>
-              <div className="text-2xl font-bold">
-                {balanceTKA ? formatUnits(balanceTKA, 18, 4) : '0'} TKA
-              </div>
+              <div className="text-2xl font-bold">{balanceTKA ? formatUnits(balanceTKA, 18, 4) : '0'} TKA</div>
             </div>
             <div className="bg-white rounded-lg shadow p-6">
               <div className="text-sm text-gray-600 mb-1">Token B Balance</div>
-              <div className="text-2xl font-bold">
-                {balanceTKB ? formatUnits(balanceTKB, 18, 4) : '0'} TKB
-              </div>
+              <div className="text-2xl font-bold">{balanceTKB ? formatUnits(balanceTKB, 18, 4) : '0'} TKB</div>
             </div>
             <div className="bg-white rounded-lg shadow p-6">
               <div className="text-sm text-gray-600 mb-1">Reward Token Balance</div>
-              <div className="text-2xl font-bold">
-                {balanceDRT ? formatUnits(balanceDRT, 18, 4) : '0'} DRT
-              </div>
+              <div className="text-2xl font-bold">{balanceDRT ? formatUnits(balanceDRT, 18, 4) : '0'} DRT</div>
             </div>
           </div>
 
@@ -266,30 +362,18 @@ export default function DashboardPage() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
             <div className="bg-gradient-to-br from-cyan-500 to-cyan-600 rounded-lg shadow-lg p-6 text-white">
               <div className="text-sm opacity-90 mb-1">💎 LP 持仓</div>
-              <div className="text-2xl font-bold">
-                {totalLPHoldings} LP
-              </div>
-              <div className="text-xs mt-2 opacity-80">
-                钱包中的 LP Token
-              </div>
+              <div className="text-2xl font-bold">{totalLPHoldings} LP</div>
+              <div className="text-xs mt-2 opacity-80">钱包中的 LP Token</div>
             </div>
             <div className="bg-gradient-to-br from-indigo-500 to-indigo-600 rounded-lg shadow-lg p-6 text-white">
               <div className="text-sm opacity-90 mb-1">🌾 Farm 质押</div>
-              <div className="text-2xl font-bold">
-                {totalStaked.toFixed(6)} LP
-              </div>
-              <div className="text-xs mt-2 opacity-80">
-                已质押到 Farm 的 LP
-              </div>
+              <div className="text-2xl font-bold">{totalStaked.toFixed(6)} LP</div>
+              <div className="text-xs mt-2 opacity-80">已质押到 Farm 的 LP</div>
             </div>
             <div className="bg-gradient-to-br from-yellow-500 to-yellow-600 rounded-lg shadow-lg p-6 text-white">
               <div className="text-sm opacity-90 mb-1">💰 待领取收益</div>
-              <div className="text-2xl font-bold">
-                {totalPendingRewards.toFixed(6)} DRT
-              </div>
-              <div className="text-xs mt-2 opacity-80">
-                所有 Farm 池的总收益
-              </div>
+              <div className="text-2xl font-bold">{totalPendingRewards.toFixed(6)} DRT</div>
+              <div className="text-xs mt-2 opacity-80">所有 Farm 池的总收益</div>
             </div>
           </div>
         </>
@@ -301,7 +385,8 @@ export default function DashboardPage() {
           <div className="text-sm opacity-90 mb-1">Token Price</div>
           <div className="text-3xl font-bold">${priceData?.price?.toFixed(4) || '0'}</div>
           <div className={`text-sm mt-2 ${priceData?.change24h >= 0 ? 'text-green-200' : 'text-red-200'}`}>
-            {priceData?.change24h >= 0 ? '+' : ''}{priceData?.change24h?.toFixed(2)}% (24h)
+            {priceData?.change24h >= 0 ? '+' : ''}
+            {priceData?.change24h?.toFixed(2)}% (24h)
           </div>
         </div>
 
@@ -314,16 +399,12 @@ export default function DashboardPage() {
 
         <div className="bg-gradient-to-br from-green-500 to-green-600 rounded-lg shadow-lg p-6 text-white">
           <div className="text-sm opacity-90 mb-1">Farm TVL</div>
-          <div className="text-3xl font-bold">
-            {farmData ? formatUSD(farmData.totalValueLocked) : '$0'}
-          </div>
+          <div className="text-3xl font-bold">{farmData ? formatUSD(farmData.totalValueLocked) : '$0'}</div>
         </div>
 
         <div className="bg-gradient-to-br from-orange-500 to-orange-600 rounded-lg shadow-lg p-6 text-white">
           <div className="text-sm opacity-90 mb-1">Active Users</div>
-          <div className="text-3xl font-bold">
-            {farmData ? formatNumber(farmData.activeUsers) : '0'}
-          </div>
+          <div className="text-3xl font-bold">{farmData ? formatNumber(farmData.activeUsers) : '0'}</div>
         </div>
       </div>
 
@@ -337,9 +418,7 @@ export default function DashboardPage() {
               <button
                 onClick={() => setPriceDays(7)}
                 className={`px-3 py-1 text-sm rounded-lg transition-colors ${
-                  priceDays === 7
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                  priceDays === 7 ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
                 }`}
               >
                 7天
@@ -347,9 +426,7 @@ export default function DashboardPage() {
               <button
                 onClick={() => setPriceDays(30)}
                 className={`px-3 py-1 text-sm rounded-lg transition-colors ${
-                  priceDays === 30
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                  priceDays === 30 ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
                 }`}
               >
                 30天
@@ -366,9 +443,7 @@ export default function DashboardPage() {
               smooth={true}
             />
           ) : (
-            <div className="h-[350px] flex items-center justify-center text-gray-400">
-              Loading price data...
-            </div>
+            <div className="h-[350px] flex items-center justify-center text-gray-400">Loading price data...</div>
           )}
         </div>
 
@@ -377,22 +452,14 @@ export default function DashboardPage() {
           <h3 className="text-lg font-semibold mb-4">Total Value Locked</h3>
 
           {tvlChartData.length > 0 && tvlChartData[0].data.length > 0 ? (
-            <LineChartEcharts
-              series={tvlChartData}
-              height={350}
-              yAxisFormatter="${value}"
-              areaStyle={true}
-              smooth={true}
-            />
+            <LineChartEcharts series={tvlChartData} height={350} yAxisFormatter="${value}" areaStyle={true} smooth={true} />
           ) : (
-            <div className="h-[350px] flex items-center justify-center text-gray-400">
-              Loading TVL data...
-            </div>
+            <div className="h-[350px] flex items-center justify-center text-gray-400">Loading TVL data...</div>
           )}
         </div>
       </div>
 
-      {/* APY Chart - Full Width */}
+      {/* APY Chart */}
       <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
         <div className="flex justify-between items-center mb-4">
           <h3 className="text-lg font-semibold">Farm APY History</h3>
@@ -400,9 +467,7 @@ export default function DashboardPage() {
             <button
               onClick={() => setApyDays(7)}
               className={`px-3 py-1 text-sm rounded-lg transition-colors ${
-                apyDays === 7
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                apyDays === 7 ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
               }`}
             >
               7天
@@ -410,9 +475,7 @@ export default function DashboardPage() {
             <button
               onClick={() => setApyDays(30)}
               className={`px-3 py-1 text-sm rounded-lg transition-colors ${
-                apyDays === 30
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                apyDays === 30 ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
               }`}
             >
               30天
@@ -421,17 +484,9 @@ export default function DashboardPage() {
         </div>
 
         {apyChartSeries.length > 0 && apyChartSeries[0].data.length > 0 ? (
-          <LineChartEcharts
-            series={apyChartSeries}
-            height={400}
-            yAxisFormatter="{value}%"
-            areaStyle={false}
-            smooth={true}
-          />
+          <LineChartEcharts series={apyChartSeries} height={400} yAxisFormatter="{value}%" areaStyle={false} smooth={true} />
         ) : (
-          <div className="h-[400px] flex items-center justify-center text-gray-400">
-            Loading APY data...
-          </div>
+          <div className="h-[400px] flex items-center justify-center text-gray-400">Loading APY data...</div>
         )}
       </div>
 
@@ -453,7 +508,9 @@ export default function DashboardPage() {
                 <tr key={pool.id} className="border-b hover:bg-gray-50">
                   <td className="py-3 px-4">
                     <div className="font-semibold">{pool.name}</div>
-                    <div className="text-sm text-gray-600">{pool.stakingToken} → {pool.rewardToken}</div>
+                    <div className="text-sm text-gray-600">
+                      {pool.stakingToken} → {pool.rewardToken}
+                    </div>
                   </td>
                   <td className="text-right py-3 px-4 font-semibold">{formatUSD(pool.tvl)}</td>
                   <td className="text-right py-3 px-4">

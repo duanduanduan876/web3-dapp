@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   useAccount,
   useChainId,
@@ -10,15 +10,12 @@ import {
 } from 'wagmi'
 import { useConnectModal } from '@rainbow-me/rainbowkit'
 
-import {
-  parseUnits,
-  formatUnits,
-  formatUSD,
-} from '../../lib/utils/units'
+import { parseUnits, formatUnits, formatUSD } from '../../lib/utils/units'
 import { formatNumber } from '../../lib/utils/format'
 import ApproveButton from '../../components/ApproveButton'
 import { getProtocolAddress } from '../../lib/constants'
 import { FARM_ABI, ERC20_ABI } from '../../lib/abis'
+import { isAddress } from 'viem'
 
 console.log('[DEBUG] FARM_ABI length =', FARM_ABI.length)
 console.log(
@@ -26,35 +23,118 @@ console.log(
   FARM_ABI.filter((x) => x.type === 'function').map((x) => x.name)
 )
 
+const SUPPORTED_CHAIN_ID = 11155111
+const BPS_DEBOUNCE_MS = 300
+
+const ERC20_ALLOWANCE_ABI = [
+  {
+    name: 'allowance',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+]
+
+function classifyError(err) {
+  const msg = String(err?.shortMessage || err?.message || err || '')
+  const low = msg.toLowerCase()
+
+  // 用户拒签
+  if (
+    low.includes('user rejected') ||
+    low.includes('user denied') ||
+    low.includes('denied transaction') ||
+    low.includes('rejected the request') ||
+    low.includes('action_rejected') ||
+    err?.name === 'UserRejectedRequestError'
+  ) {
+    return '用户拒签'
+  }
+
+  // 合约 revert
+  if (
+    low.includes('execution reverted') ||
+    low.includes('revert') ||
+    low.includes('insufficient') ||
+    low.includes('failed to simulate') ||
+    low.includes('call exception')
+  ) {
+    return '合约 revert'
+  }
+
+  // RPC 错误
+  if (
+    low.includes('network') ||
+    low.includes('timeout') ||
+    low.includes('timed out') ||
+    low.includes('fetch') ||
+    low.includes('503') ||
+    low.includes('502') ||
+    low.includes('500') ||
+    low.includes('rpc')
+  ) {
+    return 'RPC 错误'
+  }
+
+  return '未知'
+}
+
+function toUiMsg(err) {
+  if (!err) return '未知错误'
+  if (typeof err === 'string') return err
+  return String(err?.shortMessage || err?.message || '未知错误')
+}
+
 /**
  * 单个池子的卡片
  */
 function FarmPoolCard({ pool, isMockMode }) {
   // 钱包 & 链信息
-  const { address: userAddress, isConnected, chainId } = useAccount()
+  const { address: userAddress, isConnected } = useAccount()
+  const chainId = useChainId()
   const { data: walletClient } = useWalletClient()
   const publicClient = usePublicClient()
   const { openConnectModal } = useConnectModal()
 
   const farmAddress = getProtocolAddress(chainId, 'FARM')
 
-  const [amount, setAmount] = useState('')
-  const [activeTab, setActiveTab] = useState(
-    'deposit',
-  )
+  const chainOk = chainId === SUPPORTED_CHAIN_ID
+  const addrOk = !!userAddress && isAddress(userAddress)
+  const farmAddrOk = !!farmAddress && isAddress(farmAddress)
+  const lpAddrOk = !!pool.lpTokenAddress && isAddress(pool.lpTokenAddress)
 
-  const [isDepositing, setIsDepositing] = useState(false)
-  const [isWithdrawing, setIsWithdrawing] = useState(false)
-  const [isHarvesting, setIsHarvesting] = useState(false)
+  const [amount, setAmount] = useState('')
+  const [activeTab, setActiveTab] = useState('deposit')
+
+  // ===== 6 个能力：状态机 + 错误分类 + in-flight + txHash + clear + 前置校验 =====
+  const [stage, setStage] = useState('idle') // idle → preparing → pendingWallet → confirming → success | failed
+  const [errType, setErrType] = useState(null) // 用户拒签、RPC 错误、合约 revert、未知
+  const [uiError, setUiError] = useState(null)
+
+  const inFlightRef = useRef(false)
+  const lastClickRef = useRef(0)
 
   const [depositHash, setDepositHash] = useState(null)
   const [withdrawHash, setWithdrawHash] = useState(null)
   const [harvestHash, setHarvestHash] = useState(null)
 
+  const clear = useCallback(() => {
+    setStage('idle')
+    setErrType(null)
+    setUiError(null)
+    setDepositHash(null)
+    setWithdrawHash(null)
+    setHarvestHash(null)
+    setAmount('')
+  }, [])
+
   // ===== 启动时打 LP DEBUG 日志 =====
   useEffect(() => {
     if (!farmAddress || !pool.lpTokenAddress) return
-
     console.log('[LP DEBUG] =>', {
       chainId,
       farmAddress,
@@ -64,15 +144,7 @@ function FarmPoolCard({ pool, isMockMode }) {
       userAddress,
       isMockMode,
     })
-  }, [
-    chainId,
-    farmAddress,
-    pool.lpTokenAddress,
-    pool.id,
-    isConnected,
-    userAddress,
-    isMockMode,
-  ])
+  }, [chainId, farmAddress, pool.lpTokenAddress, pool.id, isConnected, userAddress, isMockMode])
 
   // ===== on–chain 读数据 =====
 
@@ -81,18 +153,9 @@ function FarmPoolCard({ pool, isMockMode }) {
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'userInfo',
-    args:
-      !isMockMode && userAddress && pool.id !== undefined
-        ? [BigInt(pool.id), userAddress]
-        : undefined,
+    args: !isMockMode && addrOk && pool.id !== undefined ? [BigInt(pool.id), userAddress] : undefined,
     query: {
-      //enabled: false → 这个 hook 不会真的发请求
-      //enabled: true → 才真正根据 address + abi + functionName + args 去读链上数据
-      enabled:
-        !isMockMode &&
-        !!farmAddress &&
-        !!userAddress &&
-        pool.id !== undefined,
+      enabled: !isMockMode && farmAddrOk && addrOk && pool.id !== undefined && chainOk,
     },
   })
 
@@ -101,16 +164,9 @@ function FarmPoolCard({ pool, isMockMode }) {
     address: farmAddress,
     abi: FARM_ABI,
     functionName: 'pendingReward',
-    args:
-      !isMockMode && userAddress && pool.id !== undefined
-        ? [BigInt(pool.id), userAddress]
-        : undefined,
+    args: !isMockMode && addrOk && pool.id !== undefined ? [BigInt(pool.id), userAddress] : undefined,
     query: {
-      enabled:
-        !isMockMode &&
-        !!farmAddress &&
-        !!userAddress &&
-        pool.id !== undefined,
+      enabled: !isMockMode && farmAddrOk && addrOk && pool.id !== undefined && chainOk,
     },
   })
 
@@ -119,66 +175,108 @@ function FarmPoolCard({ pool, isMockMode }) {
     address: pool.lpTokenAddress,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
-    args: userAddress ? [userAddress] : undefined,
+    args: addrOk ? [userAddress] : undefined,
     query: {
-      enabled:
-        !!userAddress &&
-        !!pool.lpTokenAddress &&
-        isConnected &&
-        !isMockMode,
+      enabled: addrOk && lpAddrOk && isConnected && !isMockMode && chainOk,
     },
   })
-  
-  //“编码 + 构造 JSON-RPC” 是 viem / publicClient 干的；
+
+  // allowance(owner, spender)
+  const { data: rawAllowance } = useReadContract({
+    address: pool.lpTokenAddress,
+    abi: ERC20_ALLOWANCE_ABI,
+    functionName: 'allowance',
+    args: addrOk && farmAddrOk ? [userAddress, farmAddress] : undefined,
+    query: {
+      enabled: addrOk && lpAddrOk && farmAddrOk && isConnected && !isMockMode && chainOk,
+    },
+  })
+
   const userStaked = userInfo ? formatUnits(userInfo[0], 18, 6) : '0'
-  const userPending = pendingReward
-    ? formatUnits(pendingReward, 18, 6)
-    : '0'
-  const userLpBalance = rawLpBalance
-    ? formatUnits(rawLpBalance, 18, 6)
-    : '0'
+  const userPending = pendingReward ? formatUnits(pendingReward, 18, 6) : '0'
+  const userLpBalance = rawLpBalance ? formatUnits(rawLpBalance, 18, 6) : '0'
+
+  const stakedWei = userInfo?.[0] ?? 0n
+  const lpBalWei = rawLpBalance ?? 0n
+  const allowanceWei = rawAllowance ?? 0n
 
   // ===== 交互：Deposit / Withdraw / Harvest =====
 
   const canWrite =
-    !isMockMode && !!walletClient && !!userAddress && !!farmAddress
+    !isMockMode &&
+    !!walletClient &&
+    !!publicClient &&
+    isConnected &&
+    chainOk &&
+    addrOk &&
+    farmAddrOk &&
+    pool.id !== undefined
 
   const handleConnectWallet = () => {
     if (openConnectModal) openConnectModal()
   }
 
+  const guardClick = () => {
+    const now = Date.now()
+    if (now - lastClickRef.current < BPS_DEBOUNCE_MS) return false
+    lastClickRef.current = now
+    if (inFlightRef.current) return false
+    inFlightRef.current = true
+    return true
+  }
+
+  const releaseClick = () => {
+    inFlightRef.current = false
+  }
+
+  const precheckCommon = () => {
+    if (!isConnected) return { ok: false, msg: '请先连接钱包' }
+    if (!chainOk) return { ok: false, msg: '链不对：请切到 Sepolia' }
+    if (!addrOk) return { ok: false, msg: '地址不合法' }
+    if (!farmAddrOk) return { ok: false, msg: 'Farm 合约地址不合法/缺失' }
+    if (!lpAddrOk) return { ok: false, msg: 'LP Token 地址不合法/缺失' }
+    if (pool.id === undefined) return { ok: false, msg: 'poolId 缺失' }
+    return { ok: true }
+  }
+
   const handleDeposit = async () => {
-    if (!canWrite) {
-      console.error('[DEPOSIT] write blocked', {
-        isMockMode,
-        walletClient: !!walletClient,
-        userAddress,
-        farmAddress,
-      })
-      return
-    }
-    if (!amount || pool.id === undefined) return
-
-    const amountWei = parseUnits(amount, 18)
-
-    console.log('[CLICK] handleDeposit', {
-      amount,
-      amountWei,
-      farmAddress,
-      poolId: pool.id,
-      userAddress,
-      chainId,
-    })
+    if (!guardClick()) return
+    setUiError(null)
+    setErrType(null)
 
     try {
-      setIsDepositing(true)
+      const base = precheckCommon()
+      if (!base.ok) {
+        setErrType('未知')
+        setUiError(base.msg)
+        setStage('failed')
+        return
+      }
+      if (!amount) return
+
+      const amountWei = parseUnits(amount, 18)
+
+      // 余额不足
+      if (amountWei > lpBalWei) {
+        setErrType('合约 revert')
+        setUiError('余额不足：LP Balance 不够')
+        setStage('failed')
+        return
+      }
+
+      // allowance 不够
+      if (amountWei > allowanceWei) {
+        setErrType('合约 revert')
+        setUiError('allowance 不够：请先 Approve')
+        setStage('failed')
+        return
+      }
+
+      setStage('preparing')
+      setStage('pendingWallet')
       setDepositHash(null)
 
       const hash = await walletClient.writeContract({
-        //readContract / writeContract 方法
-        //调用 viem 的编码函数，把你传的 abi + functionName + args 编成 data；
-        //拼 JSON-RPC 请求（eth_call / eth_sendTransaction / eth_sendRawTransaction）；
-        //用 transport 发给“RPC 节点”或者“钱包 provider”。
         address: farmAddress,
         abi: FARM_ABI,
         functionName: 'deposit',
@@ -186,40 +284,48 @@ function FarmPoolCard({ pool, isMockMode }) {
         account: userAddress,
       })
 
-      console.log('[TX] deposit hash', hash)
-      //返回 hash → 存 state → 触发重渲染 → UI 出现“view on Etherscan”。
       setDepositHash(hash)
+      setStage('confirming')
 
       await publicClient.waitForTransactionReceipt({ hash })
-      const receipt = await publicClient.waitForTransactionReceipt({ hash })
-      //不断调用节点的 eth_getTransactionReceipt，轮询这笔 hash
-
-      console.log('[RECEIPT] deposit', receipt)
-
+      setStage('success')
     } catch (err) {
-      console.error('[ERR] deposit', err)
+      const t = classifyError(err)
+      setErrType(t)
+      setUiError(`${t}: ${toUiMsg(err)}`)
+      setStage('failed')
     } finally {
-      setIsDepositing(false)
+      releaseClick()
     }
   }
 
   const handleWithdraw = async () => {
-    if (!canWrite) return
-    if (!amount || pool.id === undefined) return
-
-    const amountWei = parseUnits(amount, 18)
-
-    console.log('[CLICK] handleWithdraw', {
-      amount,
-      amountWei,
-      farmAddress,
-      poolId: pool.id,
-      userAddress,
-      chainId,
-    })
+    if (!guardClick()) return
+    setUiError(null)
+    setErrType(null)
 
     try {
-      setIsWithdrawing(true)
+      const base = precheckCommon()
+      if (!base.ok) {
+        setErrType('未知')
+        setUiError(base.msg)
+        setStage('failed')
+        return
+      }
+      if (!amount) return
+
+      const amountWei = parseUnits(amount, 18)
+
+      // 余额不足（可提取不足）
+      if (amountWei > stakedWei) {
+        setErrType('合约 revert')
+        setUiError('余额不足：Your Staked 不够')
+        setStage('failed')
+        return
+      }
+
+      setStage('preparing')
+      setStage('pendingWallet')
       setWithdrawHash(null)
 
       const hash = await walletClient.writeContract({
@@ -230,29 +336,37 @@ function FarmPoolCard({ pool, isMockMode }) {
         account: userAddress,
       })
 
-      console.log('[TX] withdraw hash', hash)
       setWithdrawHash(hash)
+      setStage('confirming')
+
       await publicClient.waitForTransactionReceipt({ hash })
+      setStage('success')
     } catch (err) {
-      console.error('[ERR] withdraw', err)
+      const t = classifyError(err)
+      setErrType(t)
+      setUiError(`${t}: ${toUiMsg(err)}`)
+      setStage('failed')
     } finally {
-      setIsWithdrawing(false)
+      releaseClick()
     }
   }
 
   const handleHarvest = async () => {
-    if (!canWrite) return
-    if (pool.id === undefined) return
-
-    console.log('[CLICK] handleHarvest', {
-      farmAddress,
-      poolId: pool.id,
-      userAddress,
-      chainId,
-    })
+    if (!guardClick()) return
+    setUiError(null)
+    setErrType(null)
 
     try {
-      setIsHarvesting(true)
+      const base = precheckCommon()
+      if (!base.ok) {
+        setErrType('未知')
+        setUiError(base.msg)
+        setStage('failed')
+        return
+      }
+
+      setStage('preparing')
+      setStage('pendingWallet')
       setHarvestHash(null)
 
       const hash = await walletClient.writeContract({
@@ -263,13 +377,18 @@ function FarmPoolCard({ pool, isMockMode }) {
         account: userAddress,
       })
 
-      console.log('[TX] harvest hash', hash)
       setHarvestHash(hash)
+      setStage('confirming')
+
       await publicClient.waitForTransactionReceipt({ hash })
+      setStage('success')
     } catch (err) {
-      console.error('[ERR] harvest', err)
+      const t = classifyError(err)
+      setErrType(t)
+      setUiError(`${t}: ${toUiMsg(err)}`)
+      setStage('failed')
     } finally {
-      setIsHarvesting(false)
+      releaseClick()
     }
   }
 
@@ -277,15 +396,16 @@ function FarmPoolCard({ pool, isMockMode }) {
     if (activeTab === 'deposit') setAmount(userLpBalance)
     else setAmount(userStaked)
   }
-  
-  //只要有一件为真，这个deposit就应该被禁用
-  const isDepositDisabled =
-    !amount || isDepositing || !canWrite
 
-  const isWithdrawDisabled =
-    !amount || isWithdrawing || !canWrite
+  const txHash = depositHash || withdrawHash || harvestHash
+  const isBusy = stage === 'preparing' || stage === 'pendingWallet' || stage === 'confirming'
+  const canInteract = canWrite && !isBusy
 
-  // ===== UI =====
+  // 只要有一件为真，这个按钮应该被禁用
+  const isDepositDisabled = !amount || !canInteract || activeTab !== 'deposit'
+  const isWithdrawDisabled = !amount || !canInteract || activeTab !== 'withdraw'
+  const isHarvestDisabled = !canInteract || parseFloat(userPending) === 0
+
   return (
     <div className="bg-white rounded-lg shadow-lg p-6 mb-4">
       <div className="flex justify-between items-start mb-4">
@@ -298,13 +418,31 @@ function FarmPoolCard({ pool, isMockMode }) {
         </span>
       </div>
 
+      {/* 错误提示 */}
+      {uiError && (
+        <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+          {uiError}
+        </div>
+      )}
+
+      {/* 成功提示 + clear / again */}
+      {(stage === 'success' || stage === 'failed') && (
+        <div className="mb-3 flex items-center justify-between p-3 bg-gray-50 border rounded-lg">
+          <div className="text-sm text-gray-700">
+            状态：{stage}
+            {errType ? `（${errType}）` : ''}
+          </div>
+          <button onClick={clear} className="text-sm text-blue-600 hover:underline">
+            clear / again
+          </button>
+        </div>
+      )}
+
       {/* Pool Stats */}
       <div className="grid grid-cols-3 gap-4 mb-4">
         <div className="bg-gray-50 rounded-lg p-3">
           <div className="text-xs text-gray-600 mb-1">TVL</div>
-          <div className="text-lg font-semibold">
-            {formatUSD(pool.tvl)}
-          </div>
+          <div className="text-lg font-semibold">{formatUSD(pool.tvl)}</div>
         </div>
         <div className="bg-gray-50 rounded-lg p-3">
           <div className="text-xs text-gray-600 mb-1">Your Staked</div>
@@ -312,9 +450,7 @@ function FarmPoolCard({ pool, isMockMode }) {
         </div>
         <div className="bg-blue-50 rounded-lg p-3">
           <div className="text-xs text-blue-600 mb-1">LP Balance</div>
-          <div className="text-lg font-semibold text-blue-700">
-            {userLpBalance} LP
-          </div>
+          <div className="text-lg font-semibold text-blue-700">{userLpBalance} LP</div>
         </div>
       </div>
 
@@ -322,68 +458,31 @@ function FarmPoolCard({ pool, isMockMode }) {
       <div className="bg-gradient-to-r from-yellow-50 to-orange-50 border border-yellow-200 rounded-lg p-4 mb-4">
         <div className="flex justify-between items-center">
           <div>
-            <div className="text-sm text-gray-600 mb-1">
-              Pending Rewards
-            </div>
-            <div className="text-2xl font-bold text-orange-600">
-              {userPending} DRT
-            </div>
+            <div className="text-sm text-gray-600 mb-1">Pending Rewards</div>
+            <div className="text-2xl font-bold text-orange-600">{userPending} DRT</div>
           </div>
           {!isMockMode ? (
             <button
               onClick={handleHarvest}
-              disabled={
-                isHarvesting ||
-                parseFloat(userPending) === 0 ||
-                !canWrite
-              }
+              disabled={isHarvestDisabled}
               className="bg-orange-600 hover:bg-orange-700 disabled:bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg transition-colors"
             >
-              {isHarvesting ? 'Harvesting...' : 'Harvest'}
+              {stage === 'pendingWallet' || stage === 'confirming' ? 'Harvesting...' : 'Harvest'}
             </button>
           ) : (
-            <button
-              disabled
-              className="bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg cursor-not-allowed"
-            >
+            <button disabled className="bg-gray-400 text-white font-semibold py-2 px-4 rounded-lg cursor-not-allowed">
               Harvest (Mock)
             </button>
           )}
         </div>
       </div>
 
-      {/* Tx 成功提示（简单版） */}
-      {depositHash && (
+      {/* 交易证据：txHash 展示 + 浏览器链接 */}
+      {txHash && (
         <div className="mb-2 text-xs text-green-700">
-          Deposit tx:{' '}
+          txHash:{' '}
           <a
-            href={`https://sepolia.etherscan.io/tx/${depositHash}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline"
-          >
-            view on Etherscan
-          </a>
-        </div>
-      )}
-      {withdrawHash && (
-        <div className="mb-2 text-xs text-green-700">
-          Withdraw tx:{' '}
-          <a
-            href={`https://sepolia.etherscan.io/tx/${withdrawHash}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="underline"
-          >
-            view on Etherscan
-          </a>
-        </div>
-      )}
-      {harvestHash && (
-        <div className="mb-2 text-xs text-green-700">
-          Harvest tx:{' '}
-          <a
-            href={`https://sepolia.etherscan.io/tx/${harvestHash}`}
+            href={`https://sepolia.etherscan.io/tx/${txHash}`}
             target="_blank"
             rel="noopener noreferrer"
             className="underline"
@@ -423,18 +522,10 @@ function FarmPoolCard({ pool, isMockMode }) {
           <div className="bg-gray-50 rounded-xl p-4">
             <div className="flex justify-between mb-2">
               <label className="text-sm text-gray-600">
-                {activeTab === 'deposit'
-                  ? 'Deposit Amount'
-                  : 'Withdraw Amount'}
+                {activeTab === 'deposit' ? 'Deposit Amount' : 'Withdraw Amount'}
               </label>
-              <button
-                onClick={handleMax}
-                className="text-sm text-blue-600"
-              >
-                Balance:{' '}
-                {activeTab === 'deposit'
-                  ? userLpBalance
-                  : userStaked}
+              <button onClick={handleMax} className="text-sm text-blue-600">
+                Balance: {activeTab === 'deposit' ? userLpBalance : userStaked}
               </button>
             </div>
             <div className="flex items-center gap-3">
@@ -445,9 +536,7 @@ function FarmPoolCard({ pool, isMockMode }) {
                 placeholder="0.0"
                 className="flex-1 text-xl font-semibold bg-transparent outline-none"
               />
-              <div className="bg-white border rounded-lg px-3 py-2 font-semibold text-sm">
-                LP
-              </div>
+              <div className="bg-white border rounded-lg px-3 py-2 font-semibold text-sm">LP</div>
             </div>
           </div>
         </div>
@@ -465,8 +554,7 @@ function FarmPoolCard({ pool, isMockMode }) {
             disabled
             className="w-full bg-gray-400 text-white font-semibold py-3 px-6 rounded-lg cursor-not-allowed"
           >
-            {activeTab === 'deposit' ? 'Deposit' : 'Withdraw'} (Mock
-            Mode)
+            {activeTab === 'deposit' ? 'Deposit' : 'Withdraw'} (Mock Mode)
           </button>
         ) : activeTab === 'deposit' ? (
           <ApproveButton
@@ -480,7 +568,7 @@ function FarmPoolCard({ pool, isMockMode }) {
               disabled={isDepositDisabled}
               className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
             >
-              {isDepositing ? 'Depositing...' : 'Deposit'}
+              {stage === 'pendingWallet' || stage === 'confirming' ? 'Depositing...' : 'Deposit'}
             </button>
           </ApproveButton>
         ) : (
@@ -489,7 +577,7 @@ function FarmPoolCard({ pool, isMockMode }) {
             disabled={isWithdrawDisabled}
             className="w-full bg-red-600 hover:bg-red-700 disabled:bg-gray-400 text-white font-semibold py-3 px-6 rounded-lg transition-colors"
           >
-            {isWithdrawing ? 'Withdrawing...' : 'Withdraw'}
+            {stage === 'pendingWallet' || stage === 'confirming' ? 'Withdrawing...' : 'Withdraw'}
           </button>
         )}
       </div>
@@ -501,7 +589,6 @@ function FarmPoolCard({ pool, isMockMode }) {
  * Farm 总页面
  */
 export default function FarmPage() {
-  //首次渲染，先运行hooks
   const chainId = useChainId()
   const farmAddress = getProtocolAddress(chainId, 'FARM')
   const { address, isConnected } = useAccount()
@@ -515,15 +602,12 @@ export default function FarmPage() {
   const handleConnectWallet = () => {
     if (openConnectModal) openConnectModal()
   }
-  //首轮提交dom后，useEffect会执行
-  //React 的调度逻辑就是：“提交 fiber → 刷新 DOM → 再异步执行本轮所有 useEffect 回调”。
+
   useEffect(() => {
     setIsLoading(true)
-    //把旧的错误清理掉
     setError(null)
 
     fetch('/api/farm/stats')
-    //HTTP 非 2xx 就是 res.ok === false
       .then((res) => {
         if (!res.ok) throw new Error('Failed to fetch farm data')
         return res.json()
@@ -538,11 +622,9 @@ export default function FarmPage() {
         setError(err.message)
         setIsLoading(false)
       })
-  }, [farmAddress])//第一次挂载完后执行一次
-  
-  //如果address有值，取前6个字符，再去后4个字符，中间加上...
-  const shortAddress = (addr) =>
-  addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : ''
+  }, [farmAddress])
+
+  const shortAddress = (addr) => (addr ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : '')
 
   if (isLoading) {
     return (
@@ -559,7 +641,7 @@ export default function FarmPage() {
       </div>
     )
   }
-  //允许用户随时连接钱包（这是 UI 的常规入口，和后端是否报错没强绑定）
+
   if (error) {
     return (
       <div className="container py-12">
@@ -574,9 +656,7 @@ export default function FarmPage() {
             </button>
           </div>
           <div className="bg-white rounded-lg shadow-lg p-12 text-center">
-            <p className="text-xl font-semibold text-gray-800 mb-2">
-              Error Loading Farm Data
-            </p>
+            <p className="text-xl font-semibold text-gray-800 mb-2">Error Loading Farm Data</p>
             <p className="text-gray-600">{error}</p>
           </div>
         </div>
@@ -598,12 +678,8 @@ export default function FarmPage() {
             </button>
           </div>
           <div className="bg-white rounded-lg shadow-lg p-12 text-center">
-            <p className="text-xl font-semibold text-gray-800 mb-2">
-              No Farm Pools Available
-            </p>
-            <p className="text-gray-600">
-              Check back later for farming opportunities
-            </p>
+            <p className="text-xl font-semibold text-gray-800 mb-2">No Farm Pools Available</p>
+            <p className="text-gray-600">Check back later for farming opportunities</p>
           </div>
         </div>
       </div>
@@ -617,9 +693,7 @@ export default function FarmPage() {
         <div className="flex justify-between items-center mb-8">
           <div>
             <h1 className="text-3xl font-bold mb-2">Farm</h1>
-            <p className="text-gray-600">
-              Stake LP tokens to earn DRT rewards
-            </p>
+            <p className="text-gray-600">Stake LP tokens to earn DRT rewards</p>
           </div>
           <button
             onClick={handleConnectWallet}
@@ -632,12 +706,9 @@ export default function FarmPage() {
         {/* Mock Mode 提示 */}
         {isMockMode && (
           <div className="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
-            <p className="font-semibold text-yellow-800">
-              Mock Mode Active
-            </p>
+            <p className="font-semibold text-yellow-800">Mock Mode Active</p>
             <p className="text-sm text-yellow-700">
-              Farm contract not deployed or unavailable. Displaying
-              simulated data. Transactions are disabled.
+              Farm contract not deployed or unavailable. Displaying simulated data. Transactions are disabled.
             </p>
           </div>
         )}
@@ -645,26 +716,18 @@ export default function FarmPage() {
         {/* Overall Stats */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
           <div className="bg-gradient-to-br from-green-500 to-green-600 rounded-lg shadow-lg p-6 text-white">
-            <div className="text-sm opacity-90 mb-1">
-              Total Value Locked
-            </div>
-            <div className="text-3xl font-bold">
-              {formatUSD(farmData.totalValueLocked)}
-            </div>
+            <div className="text-sm opacity-90 mb-1">Total Value Locked</div>
+            <div className="text-3xl font-bold">{formatUSD(farmData.totalValueLocked)}</div>
           </div>
 
           <div className="bg-gradient-to-br from-blue-500 to-blue-600 rounded-lg shadow-lg p-6 text-white">
             <div className="text-sm opacity-90 mb-1">Active Farms</div>
-            <div className="text-3xl font-bold">
-              {farmData.pools.length}
-            </div>
+            <div className="text-3xl font-bold">{farmData.pools.length}</div>
           </div>
 
           <div className="bg-gradient-to-br from-purple-500 to-purple-600 rounded-lg shadow-lg p-6 text-white">
             <div className="text-sm opacity-90 mb-1">Active Users</div>
-            <div className="text-3xl font-bold">
-              {formatNumber(farmData.activeUsers)}
-            </div>
+            <div className="text-3xl font-bold">{formatNumber(farmData.activeUsers)}</div>
           </div>
         </div>
 
@@ -672,10 +735,8 @@ export default function FarmPage() {
         <div>
           <h2 className="text-xl font-bold mb-4">Available Pools</h2>
           {farmData.pools.map((pool, index) => (
-            //map((pool, index)会对数组里的每一个元素执行一次回调，当前这条池子的数据对象
             <FarmPoolCard
-            //返回的是一组卡片组件的数组
-              key={pool.id ?? `pool-${index}`}//key是列表项用来识别的稳定标识
+              key={pool.id ?? `pool-${index}`}
               pool={pool}
               isMockMode={isMockMode}
             />
@@ -685,6 +746,7 @@ export default function FarmPage() {
     </div>
   )
 }
+
 
 
 
