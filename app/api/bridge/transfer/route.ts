@@ -1,5 +1,4 @@
-// app/api/bridge/transfer/route.ts
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import {
   createPublicClient,
   createWalletClient,
@@ -13,15 +12,16 @@ import {
 import { optimismSepolia, sepolia } from 'viem/chains'
 import { privateKeyToAccount } from 'viem/accounts'
 import { TARGET_BRIDGE_ABI } from '@/lib/abis/bridge'
+import { requireSession } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 type Status = 'queued' | 'inflight' | 'complete' | 'failed'
 
-//后端保存一条记录
 type TransferRec = {
   transferId: Hex
+  userId: string
   status: Status
   progress: number
   sourceTxHash: Hex
@@ -30,9 +30,9 @@ type TransferRec = {
   error?: string
 }
 
+// 注意：在 Serverless 环境下，内存 Map 重启即丢，建议生产环境换成 Redis 或 DB
 const store = new Map<string, TransferRec>()
 
-/** 只用最小事件 ABI，避免你 SOURCE_BRIDGE_ABI 里 uint32/uint256 不一致导致 decode 失败 */
 const BRIDGE_INITIATED_EVENT_ABI = [
   {
     type: 'event',
@@ -52,9 +52,22 @@ const BRIDGE_INITIATED_TOPIC0 = keccak256(
   toBytes('BridgeInitiated(bytes32,address,address,uint256,uint32)'),
 ) as Hex
 
-function json(data: any, init?: { status?: number }) {
-  return NextResponse.json(data, { status: init?.status ?? 200 })
-}
+const SOURCE_BRIDGE_ADDRESS = (process.env.SOURCE_BRIDGE_ADDRESS ||
+  process.env.NEXT_PUBLIC_BRIDGE_SOURCE_BRIDGE_ADDRESS) as `0x${string}` | undefined
+
+const TARGET_BRIDGE_ADDRESS = process.env.TARGET_BRIDGE_ADDRESS as `0x${string}` | undefined
+
+const DEV_LOCALHOST_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i
+const CORS_ALLOW_ORIGINS = new Set(
+  (process.env.CORS_ALLOW_ORIGINS ?? '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean),
+)
+
+let _opPublic: ReturnType<typeof createPublicClient> | undefined
+let _sepoliaPublic: ReturnType<typeof createPublicClient> | undefined
+let _sepoliaWallet: ReturnType<typeof createWalletClient> | undefined
 
 function env(name: string) {
   const v = process.env[name]
@@ -62,13 +75,13 @@ function env(name: string) {
   return v
 }
 
-function assertHex32(v: any, name: string): asserts v is Hex {
+function assertHex32(v: unknown, name: string): asserts v is Hex {
   if (typeof v !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(v)) {
     throw new Error(`${name} 不是合法 bytes32：${String(v)}`)
   }
 }
 
-function assertAddress(v: any, name: string): asserts v is `0x${string}` {
+function assertAddress(v: unknown, name: string): asserts v is `0x${string}` {
   if (typeof v !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(v)) {
     throw new Error(`${name} 不是合法 address：${String(v)}`)
   }
@@ -82,15 +95,45 @@ function isHexTupleTopics(v: unknown): v is readonly [Hex, ...Hex[]] {
   return Array.isArray(v) && v.length > 0 && v.every((x) => isHex(x))
 }
 
-const SOURCE_BRIDGE_ADDRESS =
-  (process.env.SOURCE_BRIDGE_ADDRESS ||
-    process.env.NEXT_PUBLIC_BRIDGE_SOURCE_BRIDGE_ADDRESS) as `0x${string}` | undefined
+function pickAllowedOrigin(req: NextRequest) {
+  const origin = req.headers.get('origin')
+  if (!origin) return null
+  if (CORS_ALLOW_ORIGINS.has(origin)) return origin
+  if (process.env.NODE_ENV !== 'production' && DEV_LOCALHOST_RE.test(origin)) return origin
+  return null
+}
 
-const TARGET_BRIDGE_ADDRESS = process.env.TARGET_BRIDGE_ADDRESS as `0x${string}` | undefined
+function applyCors(req: NextRequest, res: NextResponse) {
+  const allowedOrigin = pickAllowedOrigin(req)
+  const reqAllowHeaders =
+    req.headers.get('access-control-request-headers') || 'Content-Type, Authorization'
 
-let _opPublic: any
-let _sepoliaPublic: any
-let _sepoliaWallet: any
+  res.headers.set('Vary', 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers')
+  res.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+  res.headers.set('Access-Control-Allow-Headers', reqAllowHeaders)
+  res.headers.set('Access-Control-Max-Age', '600')
+  res.headers.set('Cache-Control', 'no-store')
+
+  if (allowedOrigin) {
+    res.headers.set('Access-Control-Allow-Origin', allowedOrigin)
+    res.headers.set('Access-Control-Allow-Credentials', 'true')
+  }
+
+  return res
+}
+
+function json(req: NextRequest, data: any, init?: { status?: number }) {
+  return applyCors(
+    req,
+    NextResponse.json(data, {
+      status: init?.status ?? 200,
+    }),
+  )
+}
+
+function empty(req: NextRequest, status = 204) {
+  return applyCors(req, new NextResponse(null, { status }))
+}
 
 function getOpPublic() {
   if (_opPublic) return _opPublic
@@ -122,40 +165,39 @@ function getSepoliaWallet() {
 }
 
 async function waitReceiptOnOp(hash: Hex) {
-  // 用 viem 自带 wait，更靠谱
   return await getOpPublic().waitForTransactionReceipt({
     hash,
     confirmations: 1,
     timeout: 180_000,
-    pollingInterval: 1500,
+    pollingInterval: 1_500,
   })
 }
 
 function findBridgeInitiated(receipt: any) {
   if (!SOURCE_BRIDGE_ADDRESS) {
     throw new Error(
-      '缺少 SOURCE_BRIDGE_ADDRESS（后端必须有：SOURCE_BRIDGE_ADDRESS；NEXT_PUBLIC_* 只是给前端用的）',
+      '缺少 SOURCE_BRIDGE_ADDRESS',
     )
   }
+
   assertAddress(SOURCE_BRIDGE_ADDRESS, 'SOURCE_BRIDGE_ADDRESS')
 
   const wantAddr = SOURCE_BRIDGE_ADDRESS.toLowerCase()
   const wantTopic0 = BRIDGE_INITIATED_TOPIC0.toLowerCase()
-
   const logs = (receipt?.logs ?? []) as any[]
+
   for (const log of logs) {
     if (String(log.address).toLowerCase() !== wantAddr) continue
 
-    const t0 = log.topics?.[0]
-    if (!isHex(t0)) continue
-    if (String(t0).toLowerCase() !== wantTopic0) continue
+    const topic0 = log.topics?.[0]
+    if (!isHex(topic0)) continue
+    if (String(topic0).toLowerCase() !== wantTopic0) continue
 
-    // 到这里就是候选 log；必须能 decode，否则就是 ABI/类型不匹配
     if (!isHexTupleTopics(log.topics)) {
-      throw new Error('候选 BridgeInitiated log 的 topics 不合法或为空（无法 decode）')
+      throw new Error('候选 BridgeInitiated log 的 topics 不合法')
     }
     if (!isHexData(log.data)) {
-      throw new Error('候选 BridgeInitiated log 的 data 不是 Hex（无法 decode）')
+      throw new Error('候选 BridgeInitiated log 的 data 不是 Hex')
     }
 
     const decoded = decodeEventLog({
@@ -177,52 +219,58 @@ function findBridgeInitiated(receipt: any) {
   return null
 }
 
-export async function POST(req: Request) {
+function readSessionOr401(req: NextRequest) {
   try {
-    // 1) 读 body：永远返回 JSON（不再给你吐 HTML）
+    return requireSession(req)
+  } catch {
+    return null
+  }
+}
+
+export async function OPTIONS(req: NextRequest) {
+  return empty(req)
+}
+
+export async function POST(req: NextRequest) {
+  const session = readSessionOr401(req)
+  if (!session) {
+    return json(req, { success: false, error: '未登录站点' }, { status: 401 })
+  }
+
+  try {
     const raw = await req.text()
     let body: any = {}
+
     try {
       body = raw ? JSON.parse(raw) : {}
     } catch {
-      return json({ success: false, error: `Body 不是合法 JSON: ${raw.slice(0, 200)}` }, { status: 400 })
+      return json(
+        req,
+        { success: false, error: `Body 不是合法 JSON` },
+        { status: 400 },
+      )
     }
 
     const sourceTxHash = body?.sourceTxHash
     if (!sourceTxHash) {
-      return json({ success: false, error: `缺少 sourceTxHash，body=${raw.slice(0, 200)}` }, { status: 400 })
+      return json(
+        req,
+        { success: false, error: `缺少 sourceTxHash` },
+        { status: 400 },
+      )
     }
+
     assertHex32(sourceTxHash, 'sourceTxHash')
 
-    // 2) 等 OP receipt
     const receipt = await waitReceiptOnOp(sourceTxHash)
-
-    // 3) 打印关键信息（你要看就看 next dev server 控制台）
-    const logs = (receipt?.logs ?? []) as any[]
-    const logBrief = logs.slice(0, 30).map((l) => ({
-      address: l.address,
-      topic0: l.topics?.[0],
-      topicsLen: l.topics?.length ?? 0,
-    }))
-    console.log('[bridge/transfer] receipt.to=', receipt?.to)
-    console.log('[bridge/transfer] receipt.status=', receipt?.status)
-    console.log('[bridge/transfer] logsBrief=', logBrief)
-
-    // 4) 从 receipt 找事件
+    
     const evt = findBridgeInitiated(receipt)
     if (!evt) {
       return json(
+        req,
         {
           success: false,
-          error:
-            '源链 receipt 里没找到 BridgeInitiated（你调用的合约地址/事件签名/链可能不对）',
-          debug: {
-            SOURCE_BRIDGE_ADDRESS,
-            wantTopic0: BRIDGE_INITIATED_TOPIC0,
-            receiptTo: receipt?.to,
-            receiptStatus: receipt?.status,
-            logsBrief: logBrief,
-          },
+          error: '源链没找到 BridgeInitiated 事件',
         },
         { status: 500 },
       )
@@ -230,148 +278,182 @@ export async function POST(req: Request) {
 
     if (evt.dstChainId !== 11155111) {
       return json(
-        { success: false, error: `dstChainId 不对：期望 11155111(Sepolia)，实际 ${evt.dstChainId}` },
+        req,
+        {
+          success: false,
+          error: `dstChainId 不对：期望 11155111，实际 ${evt.dstChainId}`,
+        },
         { status: 500 },
       )
     }
 
-    // ---------------------------------------------------------
-  // 5) 入库 & 快速返回 (主线程逻辑)
-  // ---------------------------------------------------------
-  const transferId = evt.transferId
+    const transferId = evt.transferId
 
-  // 先检查配置，如果没有配置直接报错，不要等到后台任务才发现
-  if (!TARGET_BRIDGE_ADDRESS) throw new Error('缺少 TARGET_BRIDGE_ADDRESS')
-  assertAddress(TARGET_BRIDGE_ADDRESS, 'TARGET_BRIDGE_ADDRESS')
+    if (!TARGET_BRIDGE_ADDRESS) throw new Error('缺少 TARGET_BRIDGE_ADDRESS')
+    assertAddress(TARGET_BRIDGE_ADDRESS, 'TARGET_BRIDGE_ADDRESS')
 
-  // 初始化记录：状态为 queued (30%)
-  // 注意：这里我们创建一个基础对象，后续更新时建议拷贝新对象写入 store，避免引用污染
-  let rec: TransferRec = {
-    transferId,
-    status: 'queued',
-    progress: 30,
-    sourceTxHash,
-    targetTxHash: null,
-    createdAt: Date.now(),
-  }
-  
-  // 写入存储
-  store.set(transferId, rec)
-
-  // ---------------------------------------------------------
-  // 6) 启动后台任务 (Fire and Forget)
-  // ---------------------------------------------------------
-  // 关键点：这里没有 await，也没有把这个 Promise 返回给前端
-  // 而是开启一个独立的异步执行流
-  ;(async () => {
-    try {
-      console.log(`[Background] 开始处理 Mint: ${transferId}`)
-
-      // --- 阶段 A: 准备 Mint (70%) ---
-      rec = { ...rec, status: 'inflight', progress: 70 }
-      store.set(transferId, rec)
-
-      const targetTxHash = await getSepoliaWallet().writeContract({
-        address: TARGET_BRIDGE_ADDRESS,
-        abi: TARGET_BRIDGE_ABI,
-        functionName: 'mintFromSource',
-        args: [transferId, evt.recipient, evt.amount],
-      })
-
-      // 记录 Hash
-      rec = { ...rec, targetTxHash }
-      store.set(transferId, rec)
-      console.log(`[Background] Mint 交易已发送: ${targetTxHash}`)
-
-      // --- 阶段 B: 等待交易确认 ---
-      await getSepoliaPublic().waitForTransactionReceipt({
-        hash: targetTxHash,
-        confirmations: 1,
-        timeout: 180_000, // 3分钟超时
-        pollingInterval: 3000,
-      })
-
-      // --- 阶段 C: 完成 (100%) ---
-      rec = { ...rec, status: 'complete', progress: 100 }
-      store.set(transferId, rec)
-      console.log(`[Background] Mint 完成: ${transferId}`)
-
-    } catch (err: any) {
-      // --- 异常处理 ---
-      // 这里的错误前端是收不到 HTTP 500 的（因为请求早就返回了）
-      // 所以必须手动把数据库状态改为 failed，这样前端轮询时才知道出错了
-      //第二次捕获，异步阶段，链上交易失败、Gas 不足、等待超时
-      console.error(`[Background] Mint 失败: ${transferId}`, err)
-      
-      rec = { 
-        ...rec, 
-        status: 'failed', 
-        error: err?.message || String(err) 
-      }
-      store.set(transferId, rec)
+    let rec: TransferRec = {
+      transferId,
+      userId: session.userId,
+      status: 'queued',
+      progress: 30,
+      sourceTxHash,
+      targetTxHash: null,
+      createdAt: Date.now(),
     }
-  })()
 
-  // ---------------------------------------------------------
-  // 7) 立即向前端返回响应
-  // ---------------------------------------------------------
-  // 前端收到这个响应后，会拿到 transferId，然后开始轮询 GET 接口查进度
-  return json({ 
-    success: true, 
-    transferId, 
-    status: 'queued',
-    message: 'Request accepted. Processing in background.' 
+    store.set(transferId, rec)
+
+    // 后台处理 Mint
+    ;(async () => {
+      try {
+        rec = { ...rec, status: 'inflight', progress: 70 }
+        store.set(transferId, rec)
+
+        const targetTxHash = await getSepoliaWallet().writeContract({
+          address: TARGET_BRIDGE_ADDRESS,
+          abi: TARGET_BRIDGE_ABI,
+          functionName: 'mintFromSource',
+          args: [transferId, evt.recipient, evt.amount],
+        })
+
+        rec = { ...rec, targetTxHash }
+        store.set(transferId, rec)
+
+        await getSepoliaPublic().waitForTransactionReceipt({
+          hash: targetTxHash,
+          confirmations: 1,
+          timeout: 180_000,
+          pollingInterval: 3_000,
+        })
+
+        rec = { ...rec, status: 'complete', progress: 100 }
+        store.set(transferId, rec)
+      } catch (err: any) {
+        rec = {
+          ...rec,
+          status: 'failed',
+          error: err?.message || String(err),
+        }
+        store.set(transferId, rec)
+      }
+    })()
+
+    return json(req, {
+      success: true,
+      ...rec,
+      message: 'Request accepted. Processing in background.',
+    })
+  } catch (e: any) {
+    return json(
+      req,
+      {
+        success: false,
+        error: e?.message || String(e),
+      },
+      { status: 500 },
+    )
+  }
+}
+
+async function refreshTransferRecord(rec: TransferRec): Promise<TransferRec> {
+  if (rec.status === 'complete' || rec.status === 'failed') return rec
+
+  const bridgeAddress = TARGET_BRIDGE_ADDRESS
+  if (!bridgeAddress) return rec
+
+  assertAddress(bridgeAddress, 'TARGET_BRIDGE_ADDRESS')
+
+  const processed = await getSepoliaPublic().readContract({
+    address: bridgeAddress,
+    abi: TARGET_BRIDGE_ABI,
+    functionName: 'processed',
+    args: [rec.transferId],
   })
 
-} catch (e: any) {
-  // 这里捕获的是步骤 5 (入库) 或前面的同步错误
-  //外层捕获的是同步的错误，参数缺失、配置错误、数据库坏了
-  return json(
-    {
-      success: false,
-      error: e?.message || String(e),
-      stack: e?.stack || null,
-    },
-    { status: 500 },
-  )
-}
+  if (!processed) return rec
+
+  const next: TransferRec = {
+    ...rec,
+    status: 'complete',
+    progress: 100,
+  }
+
+  store.set(next.transferId, next)
+  return next
 }
 
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
+  const session = readSessionOr401(req)
+  if (!session) {
+    return json(req, { success: false, error: '未登录站点' }, { status: 401 })
+  }
+
   try {
     const url = new URL(req.url)
+    const transferIdsParam = url.searchParams.get('transferIds')
+
+    // 批量查询：/api/bridge/transfer?transferIds=id1,id2,id3
+    if (transferIdsParam !== null) {
+      const rawIds = [...new Set(transferIdsParam.split(',').filter(Boolean))]
+
+      if (rawIds.length === 0) {
+        return json(req, { success: false, error: '缺少 transferIds' }, { status: 400 })
+      }
+
+      if (rawIds.length > 20) {
+        return json(req, { success: false, error: '一次最多查询 20 条转账记录' }, { status: 400 })
+      }
+
+      const transferIds = rawIds.map((id, index) => {
+        assertHex32(id, `transferIds[${index}]`)
+        return id
+      })
+
+      const records = await Promise.all(
+        transferIds.map(async (transferId) => {
+          const rec = store.get(transferId)
+
+          // 前端 localStorage 中可能仍有历史记录，但开发服务重启后内存 store 已经清空。
+          // 批量查询时忽略这些记录，避免一条旧记录导致整批请求失败。
+          if (!rec || rec.userId !== session.userId) return null
+
+          return refreshTransferRecord(rec)
+        }),
+      )
+
+      return json(req, {
+        success: true,
+        records: records.filter((rec): rec is TransferRec => rec !== null),
+      })
+    }
+
+    // 保留原来的单条查询能力：/api/bridge/transfer?transferId=id
     const transferId = url.searchParams.get('transferId')
+    if (!transferId || !isHex(transferId)) {
+      throw new Error('无效的 transferId')
+    }
     assertHex32(transferId, 'transferId')
 
     const rec = store.get(transferId)
     if (!rec) {
       return json(
-        { success: false, error: '未知 transferId（你重启过 dev server，内存 store 丢了）' },
+        req,
+        { success: false, error: '未知 transferId 或记录已过期' },
         { status: 404 },
       )
     }
 
-    // 可选：链上最终一致性校验
-    if (rec.status !== 'complete' && TARGET_BRIDGE_ADDRESS) {
-      const processed = await getSepoliaPublic().readContract({
-        address: TARGET_BRIDGE_ADDRESS,
-        abi: TARGET_BRIDGE_ABI,
-        functionName: 'processed',
-        args: [transferId],
-      })
-      if (processed) {
-        rec.status = 'complete'
-        rec.progress = 100
-        store.set(transferId, rec)
-      }
+    if (rec.userId !== session.userId) {
+      return json(req, { success: false, error: '无权访问' }, { status: 403 })
     }
 
-    return json({ success: true, ...rec })
+    const next = await refreshTransferRecord(rec)
+    return json(req, { success: true, ...next })
   } catch (e: any) {
-    return json({ success: false, error: e?.message || String(e) }, { status: 400 })
+    return json(req, { success: false, error: e?.message || String(e) }, { status: 400 })
   }
 }
-
 
 
 

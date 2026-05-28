@@ -1,25 +1,67 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
-import { useAccount, useChainId, useReadContract, useSwitchChain, useWriteContract } from 'wagmi'
+import { memo, useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  useAccount,
+  useChainId,
+  useReadContract,
+  useSignMessage,
+  useSwitchChain,
+  useWriteContract,
+} from 'wagmi'
 import { useConnectModal } from '@rainbow-me/rainbowkit'
-import { formatUnits, isAddress, parseUnits, type Address, type Hex } from 'viem'
+import { formatUnits, isAddress, parseUnits, type Address } from 'viem'
 import { optimismSepolia } from 'viem/chains'
-
-// --- 1. 常量与类型定义 ---
 
 const OP_SEPOLIA_CHAIN_ID = 11155420
 const SEPOLIA_CHAIN_ID = 11155111
 const DECIMALS = 18
 const ZERO_ADDRESS: Address = '0x0000000000000000000000000000000000000000'
 
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_BASE_URL ?? '').replace(/\/$/, '')
 const tokenA = process.env.NEXT_PUBLIC_BRIDGE_TOKEN_A_ADDRESS as Address | undefined
 const sourceBridge = process.env.NEXT_PUBLIC_BRIDGE_SOURCE_BRIDGE_ADDRESS as Address | undefined
 
+// 功能开关：设置 NEXT_PUBLIC_BRIDGE_SUBMIT_ENABLED=false 时，只暂停发起新跨链任务。
+// 历史任务恢复与状态查询逻辑继续保留。
+const BRIDGE_SUBMIT_ENABLED =
+  process.env.NEXT_PUBLIC_BRIDGE_SUBMIT_ENABLED !== 'false'
+
+// 本地演示可配置成 10 秒；生产环境应按正常任务耗时配置更合理的阈值。
+const configuredStuckThreshold = Number(process.env.NEXT_PUBLIC_BRIDGE_STUCK_THRESHOLD_MS)
+const STUCK_THRESHOLD_MS =
+  Number.isFinite(configuredStuckThreshold) && configuredStuckThreshold > 0
+    ? configuredStuckThreshold
+    : 10_000
+
 const ERC20_ABI = [
-  { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ name: 'a', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
-  { type: 'function', name: 'allowance', stateMutability: 'view', inputs: [{ name: 'o', type: 'address' }, { name: 's', type: 'address' }], outputs: [{ name: '', type: 'uint256' }] },
-  { type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 's', type: 'address' }, { name: 'v', type: 'uint256' }], outputs: [{ name: '', type: 'bool' }] },
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'a', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'allowance',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'o', type: 'address' },
+      { name: 's', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'approve',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 's', type: 'address' },
+      { name: 'v', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
 ] as const
 
 const SOURCE_BRIDGE_ABI = [
@@ -48,16 +90,35 @@ type TransferItem = {
   error?: string
 }
 
-// --- 2. 增强版 LocalStorage 工具 ---
+type SiteUser = {
+  id: string
+  address: `0x${string}`
+}
 
 const LS_IDS_KEY = 'bridge:recentTransferIds'
 const LS_MAP_KEY = 'bridge:transfers:v1'
 const LS_MAX = 20
 
+// 实验时保持 true：让现有历史卡片也进入一条批量轮询请求，便于在 Network 观察。
+// 实验完成后改成 false：真实业务中只轮询 queued / inflight 记录。
+const POLL_ALL_RECORDS_FOR_EXPERIMENT = true
+
 type StoredTransfer = Pick<
   TransferItem,
   'transferId' | 'status' | 'progress' | 'sourceTxHash' | 'targetTxHash' | 'createdAt' | 'error'
 >
+
+function apiUrl(path: string) {
+  return API_BASE_URL ? `${API_BASE_URL}${path}` : path
+}
+
+function apiFetch(path: string, init?: RequestInit) {
+  return fetch(apiUrl(path), {
+    ...init,
+    credentials: 'include',
+    cache: init?.cache ?? 'no-store',
+  })
+}
 
 function safeParseJson<T>(raw: string | null): T | null {
   if (!raw) return null
@@ -77,7 +138,7 @@ function lsReadIds(): string[] {
 function lsWriteIds(ids: string[]) {
   try {
     localStorage.setItem(LS_IDS_KEY, JSON.stringify(ids))
-  } catch { /* ignore */ }
+  } catch {}
 }
 
 function lsReadMap(): Record<string, StoredTransfer> {
@@ -89,7 +150,7 @@ function lsReadMap(): Record<string, StoredTransfer> {
 function lsWriteMap(map: Record<string, StoredTransfer>) {
   try {
     localStorage.setItem(LS_MAP_KEY, JSON.stringify(map))
-  } catch { /* ignore */ }
+  } catch {}
 }
 
 function lsUpsertTransfer(item: TransferItem) {
@@ -108,7 +169,7 @@ function lsUpsertTransfer(item: TransferItem) {
 
   map[item.transferId] = stored
   const nextIds = [item.transferId, ...ids.filter((x) => x !== item.transferId)].slice(0, LS_MAX)
-  
+
   for (const id of ids) {
     if (!nextIds.includes(id)) delete map[id]
   }
@@ -151,14 +212,14 @@ function lsLoadTransfers(): TransferItem[] {
       error: it.error,
     })
   }
+
   return out
 }
-
-// --- 3. 错误分类与 API 助手 ---
 
 class ApiError extends Error {
   code?: string
   status?: number
+
   constructor(message: string, opts?: { code?: string; status?: number }) {
     super(message)
     this.name = 'ApiError'
@@ -183,66 +244,63 @@ function toUiErrorMessage(err: any): string {
 async function fetchJsonOrThrow(res: Response) {
   const raw = await res.text()
   let data: any
+
   try {
     data = JSON.parse(raw)
   } catch {
-    throw new ApiError(`API 没返回 JSON（HTTP ${res.status}）：${raw.slice(0, 200)}`, { status: res.status })
+    throw new ApiError(`API 没返回 JSON（HTTP ${res.status}）：${raw.slice(0, 200)}`, {
+      status: res.status,
+    })
   }
+
   if (!res.ok || !data?.success) {
     throw new ApiError(data?.error || `API failed (HTTP ${res.status})`, {
       status: res.status,
       code: data?.code,
     })
   }
+
   return data
 }
 
-// --- 4. 子组件：单条记录卡片 ---
+async function apiFetchJsonOrThrow(path: string, init?: RequestInit) {
+  const res = await apiFetch(path, init)
+  return fetchJsonOrThrow(res)
+}
 
-function TransferRecord({
+const TransferRecord = memo(function TransferRecord({
   item,
-  onUpdate,
 }: {
   item: TransferItem
-  onUpdate: (id: string, patch: Partial<TransferItem>) => void
 }) {
+  const [isStuck, setIsStuck] = useState(() => {
+    const isTerminal = item.status === 'complete' || item.status === 'failed'
+    return !isTerminal && Date.now() - item.createdAt >= STUCK_THRESHOLD_MS
+  })
+
   useEffect(() => {
-    if (item.status === 'complete' || item.status === 'failed') return
+    if (item.status === 'complete' || item.status === 'failed') {
+      setIsStuck(false)
+      return
+    }
 
-    let inFlight = false
-    let stopped = false
-    let controller: AbortController | null = null
+    const remaining = item.createdAt + STUCK_THRESHOLD_MS - Date.now()
 
-    const t = setInterval(async () => {
-      if (stopped || inFlight) return
-      inFlight = true
-      controller = new AbortController()
+    if (remaining <= 0) {
+      setIsStuck(true)
+      return
+    }
 
-      try {
-        const res = await fetch(`/api/bridge/transfer?transferId=${item.transferId}`, {
-          signal: controller.signal,
-        })
-        const data = await res.json()
-        if (data?.success) {
-          onUpdate(item.transferId, {
-            status: data.status,
-            progress: data.progress,
-            targetTxHash: data.targetTxHash ?? null,
-          })
-        }
-      } catch (e) { /* ignore */ } 
-      finally {
-        inFlight = false
-        controller = null
-      }
-    }, 3000)
+    setIsStuck(false)
+
+    const timerId = window.setTimeout(() => {
+      setIsStuck(true)
+    }, remaining)
 
     return () => {
-      stopped = true
-      clearInterval(t)
-      controller?.abort()
+      window.clearTimeout(timerId)
     }
-  }, [item.transferId, item.status, onUpdate])
+  }, [item.status, item.createdAt])
 
   return (
     <div className="bg-white rounded-lg shadow p-4 mb-3 border-l-4 border-blue-500">
@@ -250,25 +308,37 @@ function TransferRecord({
         <div className="font-semibold text-sm">
           ID: <span className="font-mono text-xs text-gray-500">{item.transferId.slice(0, 18)}...</span>
         </div>
-        <div className={`text-xs px-2 py-1 rounded uppercase font-bold ${
-          item.status === 'complete' ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-600'
-        }`}>
+        <div
+          className={`text-xs px-2 py-1 rounded uppercase font-bold ${
+            item.status === 'complete' ? 'bg-green-100 text-green-600' : 'bg-gray-100 text-gray-600'
+          }`}
+        >
           {item.status} ({item.progress}%)
         </div>
       </div>
+
       <div className="text-[10px] text-gray-400 font-mono truncate">Source: {item.sourceTxHash}</div>
       {item.targetTxHash && (
         <div className="text-[10px] text-blue-400 font-mono truncate">Target: {item.targetTxHash}</div>
       )}
+
+      {isStuck && (
+        <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+          处理时间较长，请稍后核对状态
+        </div>
+      )}
+
       <div className="w-full bg-gray-100 rounded-full h-1.5 mt-3">
-        <div className={`h-1.5 transition-all duration-500 ${item.status === 'complete' ? 'bg-green-500' : 'bg-blue-600'}`} 
-             style={{ width: `${item.progress}%` }} />
+        <div
+          className={`h-1.5 transition-all duration-500 ${
+            item.status === 'complete' ? 'bg-green-500' : 'bg-blue-600'
+          }`}
+          style={{ width: `${item.progress}%` }}
+        />
       </div>
     </div>
   )
-}
-
-// --- 5. 主页面组件 ---
+})
 
 export default function BridgePage() {
   const { address, isConnected } = useAccount()
@@ -276,43 +346,207 @@ export default function BridgePage() {
   const { openConnectModal } = useConnectModal()
   const { switchChainAsync } = useSwitchChain()
   const { writeContractAsync } = useWriteContract()
+  const { signMessageAsync } = useSignMessage()
 
   const [recipient, setRecipient] = useState('')
   const [amount, setAmount] = useState('')
   const [error, setError] = useState<string | null>(null)
+  // 只表示“最近一次任务状态刷新失败”，不代表跨链任务本身失败。
+  const [pollingError, setPollingError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [items, setItems] = useState<TransferItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
-  const [isSuccess, setIsSuccess] = useState(false)
-  const [sourceTxHash, setSourceTxHash] = useState<Hex | null>(null)
+  const [items, setItems] = useState<TransferItem[]>([])
+  const [siteUser, setSiteUser] = useState<SiteUser | null>(null)
+  const [authBusy, setAuthBusy] = useState(false)
 
-  // 恢复历史记录
+  const loadSiteUser = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/auth/me')
+      const data = await res.json()
+      if (res.ok && data?.success) {
+        setSiteUser(data.user)
+      } else {
+        setSiteUser(null)
+      }
+    } catch {
+      setSiteUser(null)
+    }
+  }, [])
+
   useEffect(() => {
     const restored = lsLoadTransfers()
     if (restored.length > 0) setItems(restored)
   }, [])
 
   useEffect(() => {
+    loadSiteUser()
+  }, [loadSiteUser])
+
+  useEffect(() => {
     if (address && !recipient) setRecipient(address)
   }, [address, recipient])
 
-  // 同步修正逻辑
-  const patch = useCallback((id: string, patchObj: Partial<TransferItem>) => {
-    setItems((prev) => prev.map((x) => (x.transferId === id ? { ...x, ...patchObj } : x)))
-    lsPatchTransfer(id, patchObj)
-  }, [])
+  const pollingTransferIdsKey = useMemo(() => {
+    return items
+      .filter((item) => {
+        if (POLL_ALL_RECORDS_FOR_EXPERIMENT) return true
+        return item.status !== 'complete' && item.status !== 'failed'
+      })
+      .map((item) => item.transferId)
+      .join(',')
+  }, [items])
+
+  useEffect(() => {
+    if (!pollingTransferIdsKey) {
+      setPollingError(null)
+      return
+    }
+
+    let stopped = false
+    let inFlight = false
+    let controller: AbortController | null = null
+
+    const poll = async () => {
+      if (stopped || inFlight) return
+
+      inFlight = true
+      controller = new AbortController()
+
+      try {
+        const params = new URLSearchParams({
+          transferIds: pollingTransferIdsKey,
+        })
+
+        const data = await apiFetchJsonOrThrow(`/api/bridge/transfer?${params.toString()}`, {
+          signal: controller.signal,
+        })
+
+        // 本轮状态查询成功，清除之前的临时刷新失败提示。
+        setPollingError(null)
+
+        const records: TransferItem[] = Array.isArray(data.records) ? data.records : []
+        if (stopped || records.length === 0) return
+
+        for (const rec of records) {
+          lsPatchTransfer(rec.transferId, {
+            status: rec.status,
+            progress: rec.progress,
+            targetTxHash: rec.targetTxHash ?? null,
+            error: rec.error,
+          })
+        }
+
+        const recordsById = new Map(records.map((rec) => [rec.transferId, rec]))
+
+        setItems((prev) => {
+          let changed = false
+
+          const next = prev.map((item) => {
+            const updated = recordsById.get(item.transferId)
+            if (!updated) return item
+
+            const same =
+              item.status === updated.status &&
+              item.progress === updated.progress &&
+              (item.targetTxHash ?? null) === (updated.targetTxHash ?? null) &&
+              item.error === updated.error
+
+            if (same) return item
+
+            changed = true
+            return {
+              ...item,
+              status: updated.status,
+              progress: updated.progress,
+              targetTxHash: updated.targetTxHash ?? null,
+              error: updated.error,
+            }
+          })
+
+          return changed ? next : prev
+        })
+      } catch (err: any) {
+        // cleanup 主动取消请求时，不向用户显示错误提示。
+        if (stopped || err?.name === 'AbortError') return
+
+        // 查询失败只说明本轮拿不到最新状态，保留已有卡片状态并等待下一轮重试。
+        setPollingError('状态刷新暂时失败，将自动重试')
+      } finally {
+        inFlight = false
+        controller = null
+      }
+    }
+
+    void poll()
+
+    const timerId = setInterval(() => {
+      void poll()
+    }, 3000)
+
+    return () => {
+      stopped = true
+      clearInterval(timerId)
+      controller?.abort()
+    }
+  }, [pollingTransferIdsKey])
 
   const ensureConnectedAndChain = async () => {
     if (!isConnected) {
       openConnectModal?.()
       throw new Error('请先连接钱包')
     }
+
     if (chainId !== OP_SEPOLIA_CHAIN_ID) {
       await switchChainAsync({ chainId: OP_SEPOLIA_CHAIN_ID })
     }
   }
 
-  // 无限授权逻辑
+  const loginSite = async () => {
+    if (!isConnected || !address) {
+      openConnectModal?.()
+      throw new Error('请先连接钱包')
+    }
+
+    setAuthBusy(true)
+
+    try {
+      const nonceData = await apiFetchJsonOrThrow('/api/auth/nonce', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address }),
+      })
+
+      const signature = await signMessageAsync({
+        message: nonceData.message,
+      })
+
+      const verifyData = await apiFetchJsonOrThrow('/api/auth/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          address,
+          message: nonceData.message,
+          signature,
+        }),
+      })
+
+      setSiteUser(verifyData.user)
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  const ensureSiteLogin = async () => {
+    if (!address) throw new Error('未连接钱包')
+
+    const currentSiteAddress = siteUser?.address?.toLowerCase()
+    const currentWalletAddress = address.toLowerCase()
+
+    if (currentSiteAddress === currentWalletAddress) return
+
+    await loginSite()
+  }
+
   const handleApproveIfNeeded = async (amountWei: bigint) => {
     if (!address || !tokenA || !sourceBridge || !isAddress(tokenA) || !isAddress(sourceBridge)) return
 
@@ -329,28 +563,32 @@ export default function BridgePage() {
     })
   }
 
-  // 核心跨链函数
   const handleBridge = async () => {
+    if (!BRIDGE_SUBMIT_ENABLED) {
+      setError('跨链发起功能维护中，暂时无法提交新任务')
+      return
+    }
+
     setError(null)
-    setIsSuccess(false)
     setIsLoading(false)
-    setSourceTxHash(null)
     setBusy(true)
 
     try {
-      if (!tokenA || !sourceBridge || !isAddress(tokenA) || !isAddress(sourceBridge)) throw new Error('合约地址未配置')
+      if (!tokenA || !sourceBridge || !isAddress(tokenA) || !isAddress(sourceBridge)) {
+        throw new Error('合约地址未配置')
+      }
       if (!recipient || !isAddress(recipient)) throw new Error('接收地址无效')
       if (!amount || Number(amount) <= 0) throw new Error('请输入有效金额')
 
       await ensureConnectedAndChain()
       if (!address) throw new Error('未连接钱包')
 
+      await ensureSiteLogin()
+
       const amountWei = parseUnits(amount, DECIMALS)
 
-      // 1. 授权（采用无限授权模式）
       await handleApproveIfNeeded(amountWei)
 
-      // 2. 发起跨链调用
       const txHash = await writeContractAsync({
         account: address as Address,
         chain: optimismSepolia,
@@ -361,24 +599,26 @@ export default function BridgePage() {
       })
 
       if (!txHash) throw new Error('交易未发出或取消')
-      setSourceTxHash(txHash)
-      setBusy(false)
 
-      // 3. 提交至后端入库
       setIsLoading(true)
-      const res = await fetch('/api/bridge/transfer', {
+      const data = await apiFetchJsonOrThrow('/api/bridge/transfer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sourceTxHash: txHash }),
       })
-      const data = await fetchJsonOrThrow(res)
 
-      // 4. 入库并同步本地存储
-      const newItem = data as TransferItem
+      const newItem: TransferItem = {
+        transferId: data.transferId,
+        status: data.status,
+        progress: data.progress,
+        sourceTxHash: data.sourceTxHash,
+        targetTxHash: data.targetTxHash ?? null,
+        createdAt: data.createdAt,
+        error: data.error,
+      }
+
       lsUpsertTransfer(newItem)
       setItems((prev) => [newItem, ...prev.filter((x) => x.transferId !== newItem.transferId)])
-      
-      setIsSuccess(true)
     } catch (err: any) {
       if (isUserRejected(err)) {
         setError('你取消了钱包请求')
@@ -391,7 +631,6 @@ export default function BridgePage() {
     }
   }
 
-  // --- 合约读取 Hook ---
   const { data: bal } = useReadContract({
     chainId: OP_SEPOLIA_CHAIN_ID,
     address: (tokenA ?? ZERO_ADDRESS) as Address,
@@ -413,6 +652,11 @@ export default function BridgePage() {
   const balanceText = bal ? formatUnits(bal as bigint, DECIMALS) : '0'
   const allowanceText = allowance ? formatUnits(allowance as bigint, DECIMALS) : '0'
 
+  const isSiteAuthedForCurrentWallet = useMemo(() => {
+    if (!siteUser || !address) return false
+    return siteUser.address.toLowerCase() === address.toLowerCase()
+  }, [siteUser, address])
+
   return (
     <div className="container py-10 min-h-screen bg-gray-50">
       <div className="max-w-5xl mx-auto">
@@ -422,11 +666,29 @@ export default function BridgePage() {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           <div className="lg:col-span-2 space-y-6">
             <div className="bg-white rounded-xl shadow-sm border p-6">
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-gray-50 px-4 py-3">
+                <div className="text-sm">
+                  <div className="font-semibold text-gray-800">站点登录状态</div>
+                  <div className="text-gray-500">
+                    {isSiteAuthedForCurrentWallet ? `已登录站点：${siteUser?.address}` : '未登录站点'}
+                  </div>
+                </div>
+
+                <button
+                  onClick={loginSite}
+                  disabled={authBusy || busy}
+                  className="rounded-lg bg-black px-4 py-2 text-sm font-semibold text-white disabled:bg-gray-300"
+                >
+                  {authBusy ? '签名登录中...' : '手动登录站点'}
+                </button>
+              </div>
+
               <div className="mb-6 grid grid-cols-2 gap-4">
                 <div className="p-3 bg-blue-50 rounded-lg">
                   <div className="text-[10px] text-blue-600 font-bold uppercase">余额 (TKA)</div>
                   <div className="text-lg font-mono font-bold text-blue-900">{balanceText}</div>
                 </div>
+
                 <div className="p-3 bg-gray-50 rounded-lg">
                   <div className="text-[10px] text-gray-500 font-bold uppercase">已授权额度</div>
                   <div className="text-lg font-mono font-bold text-gray-700">{allowanceText}</div>
@@ -434,19 +696,48 @@ export default function BridgePage() {
               </div>
 
               <div className="space-y-4">
+                {!BRIDGE_SUBMIT_ENABLED && (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                    跨链发起功能维护中，暂时无法提交新任务。已有历史任务仍可继续查看状态。
+                  </div>
+                )}
+
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">转账数量</label>
-                  <input className="w-full border rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500" value={amount} onChange={(e) => setAmount(e.target.value)} disabled={busy} />
+                  <input
+                    className="w-full border rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500"
+                    value={amount}
+                    onChange={(e) => setAmount(e.target.value)}
+                    disabled={!BRIDGE_SUBMIT_ENABLED || busy || authBusy}
+                  />
                 </div>
+
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">接收地址 (Sepolia)</label>
-                  <input className="w-full border rounded-lg px-4 py-3 font-mono text-sm outline-none focus:ring-2 focus:ring-blue-500" value={recipient} onChange={(e) => setRecipient(e.target.value)} disabled={busy} />
+                  <input
+                    className="w-full border rounded-lg px-4 py-3 font-mono text-sm outline-none focus:ring-2 focus:ring-blue-500"
+                    value={recipient}
+                    onChange={(e) => setRecipient(e.target.value)}
+                    disabled={!BRIDGE_SUBMIT_ENABLED || busy || authBusy}
+                  />
                 </div>
 
                 {error && <div className="p-4 bg-red-50 text-red-700 rounded-lg text-sm">{error}</div>}
-                
-                <button onClick={handleBridge} disabled={busy || isLoading} className="w-full bg-blue-600 text-white py-4 rounded-lg font-bold hover:bg-blue-700 disabled:bg-gray-300">
-                  {isLoading ? '后端入库中...' : busy ? '处理中...' : '发起跨链'}
+
+                <button
+                  onClick={handleBridge}
+                  disabled={!BRIDGE_SUBMIT_ENABLED || busy || isLoading || authBusy}
+                  className="w-full bg-blue-600 text-white py-4 rounded-lg font-bold hover:bg-blue-700 disabled:bg-gray-300"
+                >
+                  {!BRIDGE_SUBMIT_ENABLED
+                    ? '维护中，暂停发起跨链'
+                    : authBusy
+                    ? '站点签名登录中...'
+                    : isLoading
+                    ? '后端入库中...'
+                    : busy
+                    ? '处理中...'
+                    : '发起跨链'}
                 </button>
               </div>
             </div>
@@ -454,13 +745,20 @@ export default function BridgePage() {
 
           <div className="lg:col-span-1">
             <h2 className="text-xl font-bold mb-4">历史记录</h2>
+
+            {pollingError && (
+              <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                {pollingError}
+              </div>
+            )}
+
             <div className="space-y-3 max-h-[700px] overflow-y-auto pr-2">
               {items.length === 0 ? (
-                <div className="text-center py-20 bg-white rounded-xl border border-dashed text-gray-400">暂无记录</div>
+                <div className="text-center py-20 bg-white rounded-xl border border-dashed text-gray-400">
+                  暂无记录
+                </div>
               ) : (
-                items.map((it) => (
-                  <TransferRecord key={it.transferId} item={it} onUpdate={patch} />
-                ))
+                items.map((it) => <TransferRecord key={it.transferId} item={it} />)
               )}
             </div>
           </div>

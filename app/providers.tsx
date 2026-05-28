@@ -14,14 +14,14 @@ export default function Providers({ children }) {
   return (
     <WagmiProvider config={config}>
       <QueryClientProvider client={queryClient}>
-        <RainbowKitProvider>
+       <RainbowKitProvider>
           {/* 这里渲染 Navbar，保证在 WagmiProvider + RainbowKitProvider 里面 */}
           <Navbar />
          
           {children}
-        </RainbowKitProvider>
+       </RainbowKitProvider>
       </QueryClientProvider>
-    </WagmiProvider>
+   </WagmiProvider>
   )
 }
 
