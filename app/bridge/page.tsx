@@ -324,7 +324,7 @@ const TransferRecord = memo(function TransferRecord({
 
       {isStuck && (
         <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
-          处理时间较长，请稍后核对状态
+          处理中，请等待
         </div>
       )}
 
