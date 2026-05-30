@@ -43,4 +43,9 @@ next-env.d.ts
 build.log
 .env*.local
 
+.env.local
+test-results/
+playwright-report/
+.DS_Store
+
 

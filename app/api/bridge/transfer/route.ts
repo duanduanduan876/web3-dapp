@@ -32,6 +32,8 @@ type TransferRec = {
 
 // 注意：在 Serverless 环境下，内存 Map 重启即丢，建议生产环境换成 Redis 或 DB
 const store = new Map<string, TransferRec>()
+// 同一笔源链交易重复 POST 时，返回已有任务，不重复启动目标链处理。
+const sourceTxIndex = new Map<string, Hex>()
 
 const BRIDGE_INITIATED_EVENT_ABI = [
   {
@@ -227,6 +229,18 @@ function readSessionOr401(req: NextRequest) {
   }
 }
 
+function returnExistingAcceptedTask(req: NextRequest, rec: TransferRec, userId: string) {
+  if (rec.userId !== userId) {
+    return json(req, { success: false, error: '无权访问该源链交易对应的任务' }, { status: 403 })
+  }
+
+  return json(req, {
+    success: true,
+    ...rec,
+    message: 'Existing request returned. Processing was not restarted.',
+  })
+}
+
 export async function OPTIONS(req: NextRequest) {
   return empty(req)
 }
@@ -262,8 +276,16 @@ export async function POST(req: NextRequest) {
 
     assertHex32(sourceTxHash, 'sourceTxHash')
 
+    const sourceTxHashKey = sourceTxHash.toLowerCase()
+    const existingTransferId = sourceTxIndex.get(sourceTxHashKey)
+    if (existingTransferId) {
+      const existingRec = store.get(existingTransferId)
+      if (existingRec) return returnExistingAcceptedTask(req, existingRec, session.userId)
+      sourceTxIndex.delete(sourceTxHashKey)
+    }
+
     const receipt = await waitReceiptOnOp(sourceTxHash)
-    
+
     const evt = findBridgeInitiated(receipt)
     if (!evt) {
       return json(
@@ -292,6 +314,19 @@ export async function POST(req: NextRequest) {
     if (!TARGET_BRIDGE_ADDRESS) throw new Error('缺少 TARGET_BRIDGE_ADDRESS')
     assertAddress(TARGET_BRIDGE_ADDRESS, 'TARGET_BRIDGE_ADDRESS')
 
+    // 查询源链回执期间，可能已有相同 sourceTxHash 的请求先完成了任务登记。
+    const acceptedDuringVerification = sourceTxIndex.get(sourceTxHashKey)
+    if (acceptedDuringVerification) {
+      const existingRec = store.get(acceptedDuringVerification)
+      if (existingRec) return returnExistingAcceptedTask(req, existingRec, session.userId)
+    }
+
+    const existingByTransferId = store.get(transferId)
+    if (existingByTransferId) {
+      sourceTxIndex.set(sourceTxHashKey, transferId)
+      return returnExistingAcceptedTask(req, existingByTransferId, session.userId)
+    }
+
     let rec: TransferRec = {
       transferId,
       userId: session.userId,
@@ -302,12 +337,14 @@ export async function POST(req: NextRequest) {
       createdAt: Date.now(),
     }
 
+    // 先记录已接管，再启动后台目标链处理。后续重复 POST 只返回已有 rec。
+    sourceTxIndex.set(sourceTxHashKey, transferId)
     store.set(transferId, rec)
 
     // 后台处理 Mint
     ;(async () => {
       try {
-        rec = { ...rec, status: 'inflight', progress: 70 }
+        rec = { ...rec, status: 'inflight', progress: 70, error: undefined }
         store.set(transferId, rec)
 
         const targetTxHash = await getSepoliaWallet().writeContract({
@@ -317,23 +354,29 @@ export async function POST(req: NextRequest) {
           args: [transferId, evt.recipient, evt.amount],
         })
 
-        rec = { ...rec, targetTxHash }
+        rec = { ...rec, targetTxHash, error: undefined }
         store.set(transferId, rec)
 
-        await getSepoliaPublic().waitForTransactionReceipt({
+        const targetReceipt = await getSepoliaPublic().waitForTransactionReceipt({
           hash: targetTxHash,
           confirmations: 1,
           timeout: 180_000,
           pollingInterval: 3_000,
         })
 
-        rec = { ...rec, status: 'complete', progress: 100 }
+        if (targetReceipt.status === 'reverted') {
+          rec = { ...rec, status: 'failed', error: '目标链交易执行失败' }
+        } else {
+          rec = { ...rec, status: 'complete', progress: 100, error: undefined }
+        }
         store.set(transferId, rec)
-      } catch (err: any) {
+      } catch {
+        // 响应超时或 RPC 异常时，目标链可能已成功，先保留非终态，供后续 GET 核对 processed。
         rec = {
           ...rec,
-          status: 'failed',
-          error: err?.message || String(err),
+          status: 'inflight',
+          progress: 70,
+          error: '目标链处理结果暂未确认，将继续查询链上状态',
         }
         store.set(transferId, rec)
       }
@@ -377,6 +420,7 @@ async function refreshTransferRecord(rec: TransferRec): Promise<TransferRec> {
     ...rec,
     status: 'complete',
     progress: 100,
+    error: undefined,
   }
 
   store.set(next.transferId, next)

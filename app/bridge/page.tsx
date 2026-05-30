@@ -90,6 +90,14 @@ type TransferItem = {
   error?: string
 }
 
+// 源链交易已经发出，但后端还没有返回正式 transferId 的本地待恢复记录。
+type PendingSourceTx = {
+  sourceTxHash: `0x${string}`
+  status: 'waiting_backend'
+  createdAt: number
+  error?: string
+}
+
 type SiteUser = {
   id: string
   address: `0x${string}`
@@ -97,11 +105,12 @@ type SiteUser = {
 
 const LS_IDS_KEY = 'bridge:recentTransferIds'
 const LS_MAP_KEY = 'bridge:transfers:v1'
+const LS_PENDING_SOURCE_TXS_KEY = 'bridge:pendingSourceTxs:v1'
 const LS_MAX = 20
 
 // 实验时保持 true：让现有历史卡片也进入一条批量轮询请求，便于在 Network 观察。
 // 实验完成后改成 false：真实业务中只轮询 queued / inflight 记录。
-const POLL_ALL_RECORDS_FOR_EXPERIMENT = true
+const POLL_ALL_RECORDS_FOR_EXPERIMENT = false
 
 type StoredTransfer = Pick<
   TransferItem,
@@ -216,6 +225,50 @@ function lsLoadTransfers(): TransferItem[] {
   return out
 }
 
+function lsLoadPendingSourceTxs(): PendingSourceTx[] {
+  const raw = typeof window !== 'undefined' ? localStorage.getItem(LS_PENDING_SOURCE_TXS_KEY) : null
+  const arr = safeParseJson<unknown>(raw)
+  if (!Array.isArray(arr)) return []
+
+  return arr
+    .filter((item): item is PendingSourceTx => {
+      if (!item || typeof item !== 'object') return false
+      const value = item as Record<string, unknown>
+      return (
+        typeof value.sourceTxHash === 'string' &&
+        /^0x[0-9a-fA-F]{64}$/.test(value.sourceTxHash) &&
+        value.status === 'waiting_backend' &&
+        typeof value.createdAt === 'number'
+      )
+    })
+    .slice(0, LS_MAX)
+}
+
+function lsWritePendingSourceTxs(items: PendingSourceTx[]) {
+  try {
+    localStorage.setItem(LS_PENDING_SOURCE_TXS_KEY, JSON.stringify(items.slice(0, LS_MAX)))
+  } catch {}
+}
+
+function lsUpsertPendingSourceTx(item: PendingSourceTx) {
+  const current = lsLoadPendingSourceTxs()
+  const next = [item, ...current.filter((x) => x.sourceTxHash !== item.sourceTxHash)].slice(0, LS_MAX)
+  lsWritePendingSourceTxs(next)
+}
+
+function lsPatchPendingSourceTx(sourceTxHash: string, patch: Partial<PendingSourceTx>) {
+  const current = lsLoadPendingSourceTxs()
+  const next = current.map((item) =>
+    item.sourceTxHash === sourceTxHash ? { ...item, ...patch } : item,
+  )
+  lsWritePendingSourceTxs(next)
+}
+
+function lsRemovePendingSourceTx(sourceTxHash: string) {
+  const current = lsLoadPendingSourceTxs()
+  lsWritePendingSourceTxs(current.filter((item) => item.sourceTxHash !== sourceTxHash))
+}
+
 class ApiError extends Error {
   code?: string
   status?: number
@@ -267,6 +320,44 @@ async function apiFetchJsonOrThrow(path: string, init?: RequestInit) {
   const res = await apiFetch(path, init)
   return fetchJsonOrThrow(res)
 }
+
+const PendingSourceRecord = memo(function PendingSourceRecord({
+  item,
+  isRetrying,
+  onRetry,
+}: {
+  item: PendingSourceTx
+  isRetrying: boolean
+  onRetry: (sourceTxHash: `0x${string}`) => void
+}) {
+  return (
+    <div className="bg-white rounded-lg shadow p-4 mb-3 border-l-4 border-amber-500">
+      <div className="flex items-center justify-between mb-2">
+        <div className="font-semibold text-sm">待后台接管</div>
+        <div className="text-xs px-2 py-1 rounded uppercase font-bold bg-amber-100 text-amber-700">
+          waiting
+        </div>
+      </div>
+
+      <div className="text-[10px] text-gray-400 font-mono truncate">Source: {item.sourceTxHash}</div>
+
+      <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2 py-2 text-[11px] text-amber-800">
+        源链交易已发出，后台处理暂未确认。请勿重新发起跨链，请重试处理这笔已有交易。
+      </div>
+
+      {item.error && <div className="mt-2 text-[11px] text-red-600">{item.error}</div>}
+
+      <button
+        type="button"
+        onClick={() => onRetry(item.sourceTxHash)}
+        disabled={isRetrying}
+        className="mt-3 w-full rounded-lg bg-amber-600 px-3 py-2 text-sm font-semibold text-white disabled:bg-gray-300"
+      >
+        {isRetrying ? '重试处理中...' : '重试处理'}
+      </button>
+    </div>
+  )
+})
 
 const TransferRecord = memo(function TransferRecord({
   item,
@@ -356,6 +447,8 @@ export default function BridgePage() {
   const [busy, setBusy] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [items, setItems] = useState<TransferItem[]>([])
+  const [pendingSourceTxs, setPendingSourceTxs] = useState<PendingSourceTx[]>([])
+  const [registeringSourceTxHash, setRegisteringSourceTxHash] = useState<`0x${string}` | null>(null)
   const [siteUser, setSiteUser] = useState<SiteUser | null>(null)
   const [authBusy, setAuthBusy] = useState(false)
 
@@ -376,6 +469,9 @@ export default function BridgePage() {
   useEffect(() => {
     const restored = lsLoadTransfers()
     if (restored.length > 0) setItems(restored)
+
+    const pending = lsLoadPendingSourceTxs()
+    if (pending.length > 0) setPendingSourceTxs(pending)
   }, [])
 
   useEffect(() => {
@@ -563,6 +659,50 @@ export default function BridgePage() {
     })
   }
 
+  const registerSubmittedSourceTx = async (sourceTxHash: `0x${string}`) => {
+    setIsLoading(true)
+    setRegisteringSourceTxHash(sourceTxHash)
+
+    try {
+      const data = await apiFetchJsonOrThrow('/api/bridge/transfer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourceTxHash }),
+      })
+
+      const newItem: TransferItem = {
+        transferId: data.transferId,
+        status: data.status,
+        progress: data.progress,
+        sourceTxHash: data.sourceTxHash,
+        targetTxHash: data.targetTxHash ?? null,
+        createdAt: data.createdAt,
+        error: data.error,
+      }
+
+      lsUpsertTransfer(newItem)
+      setItems((prev) => [newItem, ...prev.filter((x) => x.transferId !== newItem.transferId)])
+
+      lsRemovePendingSourceTx(sourceTxHash)
+      setPendingSourceTxs((prev) => prev.filter((x) => x.sourceTxHash !== sourceTxHash))
+    } catch (err: any) {
+      const message = toUiErrorMessage(err)
+      lsPatchPendingSourceTx(sourceTxHash, { error: message })
+      setPendingSourceTxs((prev) =>
+        prev.map((item) => (item.sourceTxHash === sourceTxHash ? { ...item, error: message } : item)),
+      )
+      setError('源链交易已发出，但后台处理暂未确认。请在历史记录中点击“重试处理”。')
+    } finally {
+      setIsLoading(false)
+      setRegisteringSourceTxHash(null)
+    }
+  }
+
+  const retryPendingSourceTx = async (sourceTxHash: `0x${string}`) => {
+    setError(null)
+    await registerSubmittedSourceTx(sourceTxHash)
+  }
+
   const handleBridge = async () => {
     if (!BRIDGE_SUBMIT_ENABLED) {
       setError('跨链发起功能维护中，暂时无法提交新任务')
@@ -600,25 +740,20 @@ export default function BridgePage() {
 
       if (!txHash) throw new Error('交易未发出或取消')
 
-      setIsLoading(true)
-      const data = await apiFetchJsonOrThrow('/api/bridge/transfer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sourceTxHash: txHash }),
-      })
-
-      const newItem: TransferItem = {
-        transferId: data.transferId,
-        status: data.status,
-        progress: data.progress,
-        sourceTxHash: data.sourceTxHash,
-        targetTxHash: data.targetTxHash ?? null,
-        createdAt: data.createdAt,
-        error: data.error,
+      // 源链交易一旦得到哈希，立刻保存待接管记录；后端登记失败时重试同一笔交易。
+      const pending: PendingSourceTx = {
+        sourceTxHash: txHash as `0x${string}`,
+        status: 'waiting_backend',
+        createdAt: Date.now(),
       }
 
-      lsUpsertTransfer(newItem)
-      setItems((prev) => [newItem, ...prev.filter((x) => x.transferId !== newItem.transferId)])
+      lsUpsertPendingSourceTx(pending)
+      setPendingSourceTxs((prev) => [
+        pending,
+        ...prev.filter((x) => x.sourceTxHash !== pending.sourceTxHash),
+      ])
+
+      await registerSubmittedSourceTx(pending.sourceTxHash)
     } catch (err: any) {
       if (isUserRejected(err)) {
         setError('你取消了钱包请求')
@@ -753,12 +888,22 @@ export default function BridgePage() {
             )}
 
             <div className="space-y-3 max-h-[700px] overflow-y-auto pr-2">
-              {items.length === 0 ? (
+              {pendingSourceTxs.length === 0 && items.length === 0 ? (
                 <div className="text-center py-20 bg-white rounded-xl border border-dashed text-gray-400">
                   暂无记录
                 </div>
               ) : (
-                items.map((it) => <TransferRecord key={it.transferId} item={it} />)
+                <>
+                  {pendingSourceTxs.map((pending) => (
+                    <PendingSourceRecord
+                      key={pending.sourceTxHash}
+                      item={pending}
+                      isRetrying={registeringSourceTxHash === pending.sourceTxHash}
+                      onRetry={retryPendingSourceTx}
+                    />
+                  ))}
+                  {items.map((it) => <TransferRecord key={it.transferId} item={it} />)}
+                </>
               )}
             </div>
           </div>
