@@ -15,6 +15,12 @@
 - **轮询并发控制**：in-flight 防重复请求 + AbortController 避免卸载后回写
 - **Bridge 事件驱动闭环**：源链 tx → 后端解析 receipt/logs → transferId → 目标链 mint → 前端状态机轮询
 - **类型与地址安全**：统一 Address 校验与类型收敛，减少 string/0x/BigInt 引发的运行时与构建问题
+- **异步任务恢复**：Bridge 任务使用 `localStorage` 保存历史任务快照，页面重新打开后恢复任务卡片，并按 `transferId` 继续查询后端最新状态。
+* **状态查询稳定性**：批量轮询中使用 `inFlight` 防止请求重叠，使用 `AbortController` 和 cleanup 阻止旧请求在组件卸载或条件变化后继续回写页面。
+* **异常可见化**：状态查询短暂失败时保留最后可信状态并提示自动重试；任务长时间未进入终态时显示“处理时间较长，请稍后核对状态”，但不误判为 failed。
+* **提交维护开关**：支持关闭新的 Bridge 提交入口，同时保留历史任务展示和状态查询能力。
+* **测试与回归**：使用 Vitest 覆盖用户拒签判断、API 错误转换和本地缓存工具函数；使用 Playwright E2E 验证任务展示、状态更新、查询失败恢复和卡单提示。
+
 
 ---
 
@@ -111,6 +117,20 @@
 ```bash
 npm i
 
+2）启动开发服务器
+npm run dev
+
+默认访问：
+
+http://localhost:3007
+3）运行单元测试
+npm test -- --run
+4）运行 E2E 测试
+npm run test:e2e
+
+调试时可以显示浏览器窗口：
+
+npm run test:e2e:headed -- --workers=1
 
 
 
