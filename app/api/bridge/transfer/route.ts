@@ -30,9 +30,10 @@ type TransferRec = {
   error?: string
 }
 
-// 注意：在 Serverless 环境下，内存 Map 重启即丢，建议生产环境换成 Redis 或 DB
+// 注意：transfer 记录这里仍然是内存 Map。
+// 这次改 Redis，先只把 auth 的 challenge/session 从 Map 换成 Redis。
+// transfer 业务记录生产更适合放数据库。
 const store = new Map<string, TransferRec>()
-// 同一笔源链交易重复 POST 时，返回已有任务，不重复启动目标链处理。
 const sourceTxIndex = new Map<string, Hex>()
 
 const BRIDGE_INITIATED_EVENT_ABI = [
@@ -67,9 +68,9 @@ const CORS_ALLOW_ORIGINS = new Set(
     .filter(Boolean),
 )
 
-let _opPublic: ReturnType<typeof createPublicClient> | undefined
-let _sepoliaPublic: ReturnType<typeof createPublicClient> | undefined
-let _sepoliaWallet: ReturnType<typeof createWalletClient> | undefined
+let _opPublic: any
+let _sepoliaPublic: any
+let _sepoliaWallet: any
 
 function env(name: string) {
   const v = process.env[name]
@@ -177,9 +178,7 @@ async function waitReceiptOnOp(hash: Hex) {
 
 function findBridgeInitiated(receipt: any) {
   if (!SOURCE_BRIDGE_ADDRESS) {
-    throw new Error(
-      '缺少 SOURCE_BRIDGE_ADDRESS',
-    )
+    throw new Error('缺少 SOURCE_BRIDGE_ADDRESS')
   }
 
   assertAddress(SOURCE_BRIDGE_ADDRESS, 'SOURCE_BRIDGE_ADDRESS')
@@ -221,9 +220,9 @@ function findBridgeInitiated(receipt: any) {
   return null
 }
 
-function readSessionOr401(req: NextRequest) {
+async function readSessionOr401(req: NextRequest) {
   try {
-    return requireSession(req)
+    return await requireSession(req)
   } catch {
     return null
   }
@@ -246,7 +245,7 @@ export async function OPTIONS(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const session = readSessionOr401(req)
+  const session = await readSessionOr401(req)
   if (!session) {
     return json(req, { success: false, error: '未登录站点' }, { status: 401 })
   }
@@ -314,7 +313,6 @@ export async function POST(req: NextRequest) {
     if (!TARGET_BRIDGE_ADDRESS) throw new Error('缺少 TARGET_BRIDGE_ADDRESS')
     assertAddress(TARGET_BRIDGE_ADDRESS, 'TARGET_BRIDGE_ADDRESS')
 
-    // 查询源链回执期间，可能已有相同 sourceTxHash 的请求先完成了任务登记。
     const acceptedDuringVerification = sourceTxIndex.get(sourceTxHashKey)
     if (acceptedDuringVerification) {
       const existingRec = store.get(acceptedDuringVerification)
@@ -337,11 +335,9 @@ export async function POST(req: NextRequest) {
       createdAt: Date.now(),
     }
 
-    // 先记录已接管，再启动后台目标链处理。后续重复 POST 只返回已有 rec。
     sourceTxIndex.set(sourceTxHashKey, transferId)
     store.set(transferId, rec)
 
-    // 后台处理 Mint
     ;(async () => {
       try {
         rec = { ...rec, status: 'inflight', progress: 70, error: undefined }
@@ -371,7 +367,6 @@ export async function POST(req: NextRequest) {
         }
         store.set(transferId, rec)
       } catch {
-        // 响应超时或 RPC 异常时，目标链可能已成功，先保留非终态，供后续 GET 核对 processed。
         rec = {
           ...rec,
           status: 'inflight',
@@ -428,7 +423,7 @@ async function refreshTransferRecord(rec: TransferRec): Promise<TransferRec> {
 }
 
 export async function GET(req: NextRequest) {
-  const session = readSessionOr401(req)
+  const session = await readSessionOr401(req)
   if (!session) {
     return json(req, { success: false, error: '未登录站点' }, { status: 401 })
   }
@@ -437,7 +432,6 @@ export async function GET(req: NextRequest) {
     const url = new URL(req.url)
     const transferIdsParam = url.searchParams.get('transferIds')
 
-    // 批量查询：/api/bridge/transfer?transferIds=id1,id2,id3
     if (transferIdsParam !== null) {
       const rawIds = [...new Set(transferIdsParam.split(',').filter(Boolean))]
 
@@ -458,8 +452,6 @@ export async function GET(req: NextRequest) {
         transferIds.map(async (transferId) => {
           const rec = store.get(transferId)
 
-          // 前端 localStorage 中可能仍有历史记录，但开发服务重启后内存 store 已经清空。
-          // 批量查询时忽略这些记录，避免一条旧记录导致整批请求失败。
           if (!rec || rec.userId !== session.userId) return null
 
           return refreshTransferRecord(rec)
@@ -472,7 +464,6 @@ export async function GET(req: NextRequest) {
       })
     }
 
-    // 保留原来的单条查询能力：/api/bridge/transfer?transferId=id
     const transferId = url.searchParams.get('transferId')
     if (!transferId || !isHex(transferId)) {
       throw new Error('无效的 transferId')

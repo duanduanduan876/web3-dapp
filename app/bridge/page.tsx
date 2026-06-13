@@ -613,8 +613,9 @@ export default function BridgePage() {
       })
 
       const signature = await signMessageAsync({
-        message: nonceData.message,
-      })
+  account: address as Address,
+  message: String(nonceData.message),
+})
 
       const verifyData = await apiFetchJsonOrThrow('/api/auth/verify', {
         method: 'POST',

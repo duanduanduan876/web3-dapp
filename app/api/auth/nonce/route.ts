@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
     }
 
     const host = req.headers.get('host') || 'localhost:3000'
-    const rec = createChallenge(address, host)
+    const rec = await createChallenge(address, host)
 
     return NextResponse.json({
       success: true,

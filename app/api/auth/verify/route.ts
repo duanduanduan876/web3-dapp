@@ -40,7 +40,7 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    const challenge = getChallenge(address)
+    const challenge = await getChallenge(address)
     if (!challenge) {
       return NextResponse.json(
         { success: false, error: 'challenge 不存在或已过期' },
@@ -68,10 +68,10 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    deleteChallenge(address)
+    await deleteChallenge(address)
 
-    const userId = getOrCreateUserId(address)
-    const session = createSession(userId, address)
+    const userId = await getOrCreateUserId(address)
+    const session = await createSession(userId, address)
 
     const res = NextResponse.json({
       success: true,

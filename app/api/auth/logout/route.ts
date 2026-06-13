@@ -9,7 +9,7 @@ export const runtime = 'nodejs'
 
 export async function POST(req: NextRequest) {
   const sessionId = req.cookies.get(SESSION_COOKIE_NAME)?.value
-  deleteSession(sessionId)
+  await deleteSession(sessionId)
 
   const res = NextResponse.json({ success: true })
   res.cookies.set(SESSION_COOKIE_NAME, '', {
