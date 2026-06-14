@@ -451,6 +451,7 @@ export default function BridgePage() {
   const [registeringSourceTxHash, setRegisteringSourceTxHash] = useState<`0x${string}` | null>(null)
   const [siteUser, setSiteUser] = useState<SiteUser | null>(null)
   const [authBusy, setAuthBusy] = useState(false)
+  const [bridgeSubmitEnabled, setBridgeSubmitEnabled] = useState(BRIDGE_SUBMIT_ENABLED)
 
   const loadSiteUser = useCallback(async () => {
     try {
@@ -477,6 +478,28 @@ export default function BridgePage() {
   useEffect(() => {
     loadSiteUser()
   }, [loadSiteUser])
+
+  useEffect(() => {
+  let stopped = false
+
+  const loadConfig = async () => {
+    try {
+      const data = await apiFetchJsonOrThrow('/api/config')
+
+      if (!stopped && typeof data.bridgeSubmitEnabled === 'boolean') {
+        setBridgeSubmitEnabled(data.bridgeSubmitEnabled)
+      }
+    } catch {
+      // 配置接口失败时，保留构建时默认值，避免页面直接崩掉
+    }
+  }
+
+  void loadConfig()
+
+  return () => {
+    stopped = true
+  }
+}, [])
 
   useEffect(() => {
     if (address && !recipient) setRecipient(address)
@@ -705,7 +728,7 @@ export default function BridgePage() {
   }
 
   const handleBridge = async () => {
-    if (!BRIDGE_SUBMIT_ENABLED) {
+    if (!bridgeSubmitEnabled) {
       setError('跨链发起功能维护中，暂时无法提交新任务')
       return
     }
@@ -832,7 +855,7 @@ export default function BridgePage() {
               </div>
 
               <div className="space-y-4">
-                {!BRIDGE_SUBMIT_ENABLED && (
+                {!bridgeSubmitEnabled && (
                   <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
                     跨链发起功能维护中，暂时无法提交新任务。已有历史任务仍可继续查看状态。
                   </div>
@@ -844,7 +867,7 @@ export default function BridgePage() {
                     className="w-full border rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500"
                     value={amount}
                     onChange={(e) => setAmount(e.target.value)}
-                    disabled={!BRIDGE_SUBMIT_ENABLED || busy || authBusy}
+                    disabled={!bridgeSubmitEnabled || busy || authBusy}
                   />
                 </div>
 
@@ -854,7 +877,7 @@ export default function BridgePage() {
                     className="w-full border rounded-lg px-4 py-3 font-mono text-sm outline-none focus:ring-2 focus:ring-blue-500"
                     value={recipient}
                     onChange={(e) => setRecipient(e.target.value)}
-                    disabled={!BRIDGE_SUBMIT_ENABLED || busy || authBusy}
+                    disabled={!bridgeSubmitEnabled || busy || authBusy}
                   />
                 </div>
 
@@ -862,10 +885,10 @@ export default function BridgePage() {
 
                 <button
                   onClick={handleBridge}
-                  disabled={!BRIDGE_SUBMIT_ENABLED || busy || isLoading || authBusy}
+                  disabled={!bridgeSubmitEnabled || busy || isLoading || authBusy}
                   className="w-full bg-blue-600 text-white py-4 rounded-lg font-bold hover:bg-blue-700 disabled:bg-gray-300"
                 >
-                  {!BRIDGE_SUBMIT_ENABLED
+                  {!bridgeSubmitEnabled
                     ? '维护中，暂停发起跨链'
                     : authBusy
                     ? '站点签名登录中...'

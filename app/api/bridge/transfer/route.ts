@@ -13,6 +13,7 @@ import { optimismSepolia, sepolia } from 'viem/chains'
 import { privateKeyToAccount } from 'viem/accounts'
 import { TARGET_BRIDGE_ABI } from '@/lib/abis/bridge'
 import { requireSession } from '@/lib/auth'
+import { getBridgeSubmitEnabled } from '@/lib/feature-flags'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -245,6 +246,22 @@ export async function OPTIONS(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+
+  
+
+  const bridgeSubmitEnabled = await getBridgeSubmitEnabled()
+
+  if (!bridgeSubmitEnabled) {
+    return NextResponse.json(
+      {
+        success: false,
+        code: 'BRIDGE_SUBMIT_DISABLED',
+        error: '跨链发起功能维护中，暂时无法提交新任务',
+      },
+      { status: 503 },
+    )
+  }
+  
   const session = await readSessionOr401(req)
   if (!session) {
     return json(req, { success: false, error: '未登录站点' }, { status: 401 })
